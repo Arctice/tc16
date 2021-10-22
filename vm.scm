@@ -60,6 +60,8 @@
 ;; v0-v5 <- fast arguments
 ;; *(stack+1) ... (*frame) <- slow arguments at the top of the caller's stack
 
+(define ram-size 256)
+
 (define (register-name name)
   (case name
     [zero 0] [ip 1] [const 2]
@@ -101,7 +103,6 @@
 (define (vm instructions data)
   (let* ([instructions (list->vector instructions)]
          [registers (make-bytevector 32 0)]
-         [ram-size 128]
          [ram (make-bytevector (* ram-size 2) 0)]
          [cycles 0])
     (define (write-register r val)
@@ -340,12 +341,12 @@
               (get-symbol env form)) ;; function address call
           (let ([name (descend env form)]
                 [args (map (λ (arg) (descend env arg)) (cdr expr))])
-            (append `(addr-call ,name) args))]
+            (append `(addr-call #f ,name) args))]
 
          [else ;; direct call
           (let ([name form]
                 [args (map (λ (arg) (descend env arg)) (cdr expr))])
-            (append `(call ,name) args))])
+            (append `(call #f ,name) args))])
         )]))
 
   (define (parse-top-level block)
@@ -361,10 +362,53 @@
                       (environment-symbols fn-env) arg name)
                      name))
                  arguments)
-           ,(descend fn-env (cons 'prog body)))))
+           ,(descend fn-env `(return (prog . ,body))))))
 
   (let ([ast (cons 'program (map parse-top-level code))])
     (values ast symbol-table)))
+
+
+
+(define (annotate-tail-calls ast)
+  (define (descend expr)
+    (if (not (pair? expr)) expr
+        (let ([form (car expr)])
+          ;; (printf "~s\n" form)
+          (cond
+           [(eq? form 'program)
+            (cons form (map descend (cdr expr)))]
+           [(eq? form 'fn)
+            (let ([name (cadr expr)]
+                  [args (caddr expr)]
+                  [body (cadddr expr)])
+              `(fn ,name ,args ,(descend body)))]
+           [(eq? form 'return)
+            `(return ,(descend (cadr expr)))]
+           [(eq? form 'prog)
+            (let ([tail (last-pair expr)])
+              (append (list-head expr (- (length expr) 1))
+                      (list (descend (car tail)))))]
+           [(eq? form 'if)
+            (let ([condition (cadr expr)]
+                  [true (descend (caddr expr))]
+                  [false (cdddr expr)])
+              (if (null? false)
+                  `(if ,condition ,true)
+                  `(if ,condition ,true
+                       ,(descend (car false)))))]
+           [(eq? form 'addr-call)
+            (set-car! (cdr expr) 'tail-call)
+            expr]
+           [(eq? form 'call)
+            (set-car! (cdr expr) 'tail-call)
+            expr]
+           [(memq form '(= while)) expr]
+           [(macro? form) expr]
+           [(builtin? form) expr]
+           [else (error "tco" (format "a: ~s" form))])
+          )))
+
+  (descend ast))
 
 
 
@@ -470,7 +514,6 @@
                        `(fn-arg ,var ,position)))
                    args (enumerate args))]
                  [body (cadddr expr)]
-                 [body (append body '((return 0)))]
                  [ir (cons `(function ,name ,(length args)) ir)]
                  [ir (append (reverse args) ir)]
                  [ir (cons `(function-start) ir)])
@@ -523,20 +566,23 @@
                   (values ir if-val))))]
 
          [(memq form '(call addr-call))
-          (let eval-args ([args (cddr expr)] [arg-values '()] [arg-ir '()])
-            (if (not (null? args))
-                (let-values ([(arg-ir val) (descend env arg-ir (car args))])
-                  (eval-args (cdr args) (cons val arg-values) arg-ir))
-                (let-values ([(fn-ir fn)
-                              (case form
-                                [call (values '() (cadr expr))]
-                                [addr-call (descend env '() (cadr expr))])])
-                  (let* ([ir (append fn-ir arg-ir ir)]
-                         [args (reverse arg-values)]
-                         [call (append (list form fn) args)]
-                         [result (symgen (format "val-~s" fn))]
-                         [code `((value ,result ,call))])
-                    (values (append code ir) result)))))]
+          (let ([function (caddr expr)]
+                [args (cdddr expr)]
+                [tail? (cadr expr)])
+            (let eval-args ([args args] [arg-values '()] [arg-ir '()])
+              (if (not (null? args))
+                  (let-values ([(arg-ir val) (descend env arg-ir (car args))])
+                    (eval-args (cdr args) (cons val arg-values) arg-ir))
+                  (let-values ([(fn-ir fn)
+                                (case form
+                                  [call (values '() function)]
+                                  [addr-call (descend env '() function)])])
+                    (let* ([ir (append fn-ir arg-ir ir)]
+                           [args (reverse arg-values)]
+                           [call (append (list form tail? fn) args)]
+                           [result (symgen (format "val-~s" fn))]
+                           [code `((value ,result ,call))])
+                      (values (append code ir) result))))))]
 
          [(builtin? form)
           (let eval-args ([args (cdr expr)] [arg-values '()] [arg-ir '()])
@@ -564,8 +610,8 @@
      [cmp (_ a b) (list a b)]
      [(+ -) (a b) (list a b)]
      [(const fn-addr) _ '()]
-     [(call) (_ . args) args]
-     [addr-call (f . args) (cons f args)]
+     [call (_ _ . args) args]
+     [addr-call (_ f . args) (cons f args)]
      [else (error "lifetime"
                   (format "unknown builtin:\n   ~s" instr))]))
 
@@ -701,7 +747,7 @@
                        (mov y ,(reference! line out-var) const)))]
 
      [(call addr-call)
-      (fn . args)
+      (tail-call fn . args)
       (define fn-addr (case (car instr)
                         [call `(const-ref ,(function-label fn))]
                         [addr-call (reference! line fn)]))
@@ -712,58 +758,80 @@
          (map (λ (var) (symbol-hashtable-ref variables var #f))
               (hashtable-ref lifetimes (+ 1 line) '()))))
 
-      ;; save ret, frame
-      (emit! `((const 1)
-               (alu sub stack const)
-               (store stack ret)
-               (alu sub stack const)
-               (store stack frame)
-               ;; save registers v0-v7
-               (call-save-registers ,live-variables)))
+      (cond
+       [tail-call
+        ;; stack only args
+        (emit! `((const 1)))
+        (for-each
+         (λ (arg) (let ([var (reference! line arg)])
+                    (emit! `((alu sub stack const) (store stack ,var)))))
+         args)
+        (emit! `((mov y v6 ,fn-addr)
+                 (const ,argument-frame-size)
+                 (alu add frame const)
+                 (const ,(length args))
+                 (alu add stack const)
+                 (const 1)))
+        (for-each
+         (λ (_) (emit!
+                 `((alu sub stack const) (alu sub frame const)
+                   (load v7 stack) (store frame v7))))
+         (enumerate args))
+        ;; restore caller's stack
+        (emit! `((mov y stack frame)
+                 (const ,(length args))
+                 (alu add stack const)
+                 (mov y ip v6)))]
 
-      ;; save this stack position for reading off the arguments later
-      (emit! `((mov y ret stack)))
+       [else
+        ;; save ret, frame
+        (emit! `((const 1)
+                 (alu sub stack const)
+                 (store stack ret)
+                 (alu sub stack const)
+                 (store stack frame)
+                 ;; save registers v0-v7
+                 (call-save-registers ,live-variables)))
 
-      ;; arrange the arguments
-      (for-each
-       (λ (arg position)
-         (let ([var (reference! line arg)])
-           (if #f ;; (< position 5)
-               ;; register
-               (begin (void))
-               ;; stack
-               (begin
-                 (emit! `((alu sub stack const) (store stack ,var)))))))
-       args (enumerate args))
+        ;; save this stack position for reading off the arguments later
 
-      ;; set the new frame address
-      ;; stack <- argument section
-      ;; ret <- here (ip)
-      (emit! `((mov y frame stack)
-               (mov y stack ret)
-               (const ,ret-addr) (mov y ret const)))
+        (emit! `((mov y ret stack)))
 
-      ;; load fn address, jump
-      (emit! `((mov y ip ,fn-addr)
-               ;; return point
-               (label ,ret-addr)
-               ;; stack <- frame
-               (mov y stack frame)
-               ;; pop the stack arguments
-               (const ,(length args))
-               (alu add stack const)
-               ;; restore registers v0-v7
-               (call-restore-registers ,live-variables)))
+        ;; arrange the arguments
+        (for-each
+         (λ (arg position)
+           (let ([var (reference! line arg)])
+             (if #f ;; (< position 5)
+                 ;; register
+                 (begin (void))
+                 ;; stack
+                 (begin
+                   (emit! `((alu sub stack const) (store stack ,var)))))))
+         args (enumerate args))
 
-      ;; restore frame
-      (emit! `((load frame stack) (alu inc stack zero)))
+        ;; set the new frame address
+        ;; stack <- argument section
+        ;; ret <- here (ip)
+        (emit! `((mov y frame stack)
+                 (mov y stack ret)
+                 (const ,ret-addr) (mov y ret const)))
 
-      (let ([out (reference! line out-var)])
-        (emit! `(;; out <- return value
-                 (mov y ,out ret)
-                 ;; restore ret
-                 (const 1)
-                 (load ret stack) (alu inc stack zero))))]
+        ;; load fn address, jump
+        (emit! `((mov y ip ,fn-addr)
+                 ;; return point
+                 (label ,ret-addr)
+                 ;; restore registers v0-v7
+                 (call-restore-registers ,live-variables)))
+
+        ;; restore frame
+        (emit! `((load frame stack) (alu inc stack zero)))
+
+        (let ([out (reference! line out-var)])
+          (emit! `(;; out <- return value
+                   (mov y ,out ret)
+                   ;; restore ret
+                   (const 1)
+                   (load ret stack) (alu inc stack zero))))])]
 
      [const (value) (let* ([out (reference! line out-var)])
                       (emit! `((mov y ,out (const-ref ,value)))))]
@@ -819,6 +887,7 @@
 
          [function
           (name arg-count)
+          (set! argument-frame-size arg-count)
           (emit! `((label ,(function-label name))))]
 
          [fn-arg (var position)
@@ -832,7 +901,12 @@
           () (emit! '((alu sub stack (const-ref :frame-size))))]
 
          [return (val) (let* ([val (reference! line val)])
-                         (emit! `((mov y const ret)
+                         (emit! `(;; restore caller's stack
+                                  (mov y stack frame)
+                                  ;; pop the stack arguments
+                                  (const ,argument-frame-size)
+                                  (alu add stack const)
+                                  (mov y const ret)
                                   (mov y ret ,val)
                                   (mov y ip const))))]
 
@@ -969,38 +1043,35 @@
                            (subst 'const const-ref instruction)))))
            (load-consts (cdr asm))))))
 
-  (define (add-initialization asm)
+  (next ir 0)
+  (load-consts
+   (register-assignment (reverse asm))))
+
+(define (generate-asm ir)
+  (let* ([lifetimes (map lifetime-analysis ir)]
+         [asm-fns (map (λ (fn lifetimes) (function-asm fn lifetimes))
+                       ir lifetimes)]
+         [asm (fold-left append '() asm-fns)])
     (append `((comment 'init)
               (const ".halt")
               (mov y ret const)
-              (const 128)
+              (const ,ram-size)
               (mov y frame const)
               (mov y stack const)
               (const ,(function-label 'main))
               (alu add zero zero)
               (mov y ip const))
             asm
-            '((label ".halt"))))
-
-  (next ir 0)
-  (add-initialization
-   (load-consts
-    (register-assignment (reverse asm)))))
-
-(define (generate-asm ir)
-  (fold-left
-   append '()
-   (map (λ (block) (function-asm block (lifetime-analysis block))) ir)))
+            '((label ".halt")))))
 
 
 (define (compile code)
   (let*-values ([(ast symbols) (analyze-symbols code)]
+                [(ast) (annotate-tail-calls ast)]
+                ;; [_ (pretty-print ast)]
                 [(ir value-table) (generate-ir symbols ast)]
+                ;; [_ (pretty-print ir)]
                 [(asm) (generate-asm ir)])
-    ;; (pretty-print ast)
-    ;; (printf "\n")
-    ;; (pretty-print ir)
-    ;; (printf "\n")
     asm))
 
 (define (print-asm asm)
@@ -1022,15 +1093,6 @@
 ;; low level lisp-like language
 (printf "program          size    cycles    memory  check\n")
 (define (run-l5 name code data checks)
-  (define (memory-usage ram)
-    (let ([longest-run 0]
-          [size (bytevector-length ram)])
-      (let scan ([n 0] [run 0])
-        (set! longest-run (max run longest-run))
-        (when (< n size)
-          (scan (+ 1 n) (if (= 0 (bytevector-u8-ref ram n))
-                            (+ 1 run) 0))))
-      (/ longest-run size)))
   (let* ([asm (compile code)]
          [bin (assemble asm)]
          [result (format "~16a ~8s" name (length bin))])
@@ -1049,12 +1111,22 @@
             (print-memory ram)))
       (printf "~o\n" result))))
 
+(define (memory-usage ram)
+  (let ([longest-run 0]
+        [size (bytevector-length ram)])
+    (let scan ([n 0] [run 0])
+      (set! longest-run (max run longest-run))
+      (when (< n size)
+        (scan (+ 1 n) (if (= 0 (bytevector-u8-ref ram n))
+                          (+ 1 run) 0))))
+    (/ longest-run size)))
+
 (run-l5 "expr"
         '((fn (main)
               (= a 13)
               (= b 5)
               (= c 12)
-              (return (- (+ (+ a c) (- b b)) b))))
+              (- (+ (+ a c) (- b b)) b)))
         '()
         (λ (asm registers ram)
           (= 20 (read-register registers 'ret))))
@@ -1062,61 +1134,60 @@
 (run-l5 "reuse"
         '((fn (main)
               (= a 9)
-              (return (+ a (+ 9 9)))))
+              (+ a (+ 9 9))))
         '()
         (λ (asm registers ram)
           (= 27 (read-register registers 'ret))))
 
 (run-l5 "spill"
         '((fn (main)
-              (return
-               (+ 1 (+ 2 (+ 3 (+ 4 (+ 5 (+ 6 (+ 7 (+ 8 9)))))))))))
+              (+ 1 (+ 2 (+ 3 (+ 4 (+ 5 (+ 6 (+ 7 (+ 8 9))))))))))
         '()
         (λ (asm registers ram)
           (= 45 (read-register registers 'ret))))
 
 (run-l5 "control"
-        '((fn (main)
-              (return (if (== 0 1) (prog 1 2)
-                          (prog (if (!= 0 1) 4 3))))))
+        '((fn (main) (if (== 0 1) (prog 1 2)
+                         (prog (if (!= 0 1) 4 3)))))
         '()
         (λ (asm registers ram)
           (= 4 (read-register registers 'ret))))
 
 (run-l5 "fncall"
-        '((fn (main)
-              (return (foo 2 3)))
-          (fn (foo a b)
-              (return (bar a b 7 11)))
-          (fn (bar q w e r)
-              (return (+ q (+ w (+ e (- r 10)))))))
+        '((fn (main) (foo 2 3))
+          (fn (foo a b) (bar a b 7 11))
+          (fn (bar q w e r) (+ q (+ w (+ e (- r 10))))))
         '()
         (λ (asm registers ram)
           (= 13 (read-register registers 'ret))))
 
+(run-l5 "tail-call"
+        '((fn (main) (spin 4095))
+          (fn (spin n x) (if (< n x) (spin (+ n x) x) n)))
+        '() (λ (asm registers ram) (> 1. (memory-usage ram))))
+
 (run-l5 "fib"
-        '((fn (main) (return (fib 21)))
+        '((fn (main) (fib 21))
           (fn (fib x)
               (= a 1) (= b 1)
               (while (< 0 x)
                      (= c a) (= a b)
                      (+= b c)
                      (-= x 1))
-              (return b)))
+              b))
         '()
         (λ (asm registers ram)
           (= 28657 (read-register registers 'ret))))
 
 (run-l5 "recursion"
-        '((fn (main) (return (fib (load 0))))
+        '((fn (main) (fib (load 0)))
           (fn (fib n)
-              (return
-               (if (< n 2) 1
-                   (+ (fib (- n 1))
-                      (fib (- n 2)))))))
-        '(23)
+              (if (< n 2) 1
+                  (+ (fib (- n 1))
+                     (fib (- n 2))))))
+        '(20)
         (λ (asm registers ram)
-          (= 46368 (read-register registers 'ret))))
+          (= 10946 (read-register registers 'ret))))
 
 (run-l5 "partial-sums"
         '((fn (main)
@@ -1131,7 +1202,7 @@
                      (++ to)
                      (++ from)
                      (++ n))
-              (return sum)))
+              sum))
         '(1 2 3 4 5 6 7 8 9 65490)
         (λ (asm registers ram)
           (= 65535 (read-register registers 'ret))))
@@ -1139,42 +1210,135 @@
 
 (run-l5 "array"
         '((fn (init) (store 0 1))
-          (fn (malloc n)
-              (= stack (load 0))
-              (= new-stack (+ stack n))
-              (store 0 new-stack)
-              (return stack))
           (fn (iota out n)
               (= i 0)
               (while (< i n)
                      (store (+ i out) i)
                      (++ i)))
-          (fn (array-sum a b)
+          (fn (range-sum a b)
               (= sum 0)
               (while (< a b)
                      (+= sum (load a))
                      (++ a))
-              (return sum))
+              sum)
           (fn (main)
               (init)
               (= size 10)
-              (= arr (malloc size))
-              (iota arr size)
-              (return (array-sum arr (+ arr size)))))
+              (= arr 16)
+              (iota arr (+ arr size))
+              (range-sum arr (+ arr size))))
         '()
         (λ (asm registers ram)
           (= 45 (read-register registers 'ret))))
 
 (run-l5 "fn-addr"
-        '((fn (x f a b c) (return (f a b c)))
-          (fn (y f a b) (return (f a b)))
-          (fn (z f a) (return (f a)))
-          (fn (w a) (return a))
+        '((fn (x f a b c) (f a b c))
+          (fn (y f a b) (f a b))
+          (fn (z f a) (f a))
+          (fn (w a) a)
           (fn (main)
-              (return ((:fn-addr x)
-                       (:fn-addr y)
-                       (:fn-addr z)
-                       (:fn-addr w) 7))))
+              ((:fn-addr x)
+               (:fn-addr y)
+               (:fn-addr z)
+               (:fn-addr w) 7)))
         '()
         (λ (asm registers ram)
           (= 7 (read-register registers 'ret))))
+
+(run-l5
+ "cmp"
+ '((fn (zero? p) (== p 0))
+   (fn (main) (zero? 0)))
+ '()
+ (λ (asm registers ram) (= 1 (read-register registers 'ret))))
+
+(run-l5
+ "lib"
+ '((fn (nil? p) (== 0 p))
+
+   (fn (malloc-init) (store 0 0))
+   (fn (mmb-size p) (load (+ p 1)))
+   (fn (mmb-next p) (load p))
+   (fn (mmb-next-set! p addr) (store p addr))
+   (fn (mmb-past p) (+ p (+ 2 (mmb-size p))))
+   (fn (mmb-create! addr size)
+       (store addr 0) (store (+ addr 1) size))
+   (fn (mmb-last p) (if (nil? (mmb-next p))
+                        p (mmb-last (mmb-next p))))
+   (fn (mmb-find-parent from to)
+       (if (== to (mmb-next from))
+           from
+           (prog
+            (= next (mmb-next from))
+            (if (nil? next) 0
+                (mmb-find-parent next to)))))
+
+   (fn (malloc-find-space p size)
+       (= next (mmb-next p))
+       (if (nil? next) p
+           (prog (= gap (- next (mmb-past p)))
+                 (if (<= (+ 2 size) gap) p
+                     (malloc-find-space next size)))))
+
+   (fn (malloc size)
+       (= at (malloc-find-space 0 size))
+       (= new (mmb-past at))
+       (mmb-create! new size)
+       (mmb-next-set! new (mmb-next at))
+       (mmb-next-set! at new)
+       (+ 2 new))
+
+   (fn (free p)
+       (= p (- p 2))
+       (if (nil? p) (return 0) (prog 0))
+       (= prev (mmb-find-parent 0 p))
+       (mmb-next-set! prev (mmb-next p))
+       1)
+
+   (fn (nil) 0)
+   (fn (cons x l)
+       (= cell (malloc 2))
+       (store cell x)
+       (store (+ 1 cell) l)
+       cell)
+   (fn (car l) (load l))
+   (fn (cdr l) (load (+ 1 l)))
+   (fn (null? l) (nil? l))
+
+   (fn (map f l)
+       (if (null? l) (nil)
+           (cons (f (car l))
+                 (map f (cdr l)))))
+   (fn (filter f l)
+       (if (null? l) (nil)
+           (if (f (car l))
+               (cons (car l) (filter f (cdr l)))
+               (filter f (cdr l)))))
+
+   (fn (iota-recur i n)
+       (if (<= n i) (nil)
+           (cons i (iota-recur (+ 1 i) n))))
+   (fn (iota n) (iota-recur 0 n))
+
+   (fn (sum l)
+       (if (null? l) 0
+           (+ (car l) (sum (cdr l)))))
+
+   (fn (double x) (+ x x))
+   (fn (display x) (print x))
+
+   (fn (mul a b) (= s 0)
+       (while (< 0 a) (-= a 1) (+= s b)))
+   (fn (div a b) (= s 0)
+       (while (<= b a) (-= a b) (+= s 1)))
+   (fn (mod a b) (- a (mul b (div a b))))
+
+   (fn (even? x) (== 0 (mod x 2)))
+
+   (fn (main) (malloc-init)
+       (sum (map (:fn-addr double)
+                 (filter (:fn-addr even?)
+                         (iota 10))))))
+ '()
+ (λ (asm registers ram)
+   (= 40 (read-register registers 'ret))))
