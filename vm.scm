@@ -60,7 +60,7 @@
 ;; v0-v5 <- fast arguments
 ;; *(stack+1) ... (*frame) <- slow arguments at the top of the caller's stack
 
-(define ram-size 256)
+(define ram-size 1024)
 
 (define (register-name name)
   (case name
@@ -86,7 +86,7 @@
 (define (print-memory memory)
   (let ([size (/ (bytevector-length memory) 2)]
         [stride 8])
-    (printf "RAM ~s\n" size)
+    (printf "RAM 16-bit x~s\n" size)
     (for-each (λ (row)
                 (printf "~5s: " (* row stride 2))
                 (for-each (λ (column)
@@ -1101,7 +1101,7 @@
             (string-append
              result
              (format "~8s" cycles)
-             (format "~8o  " (format "~3,1f%" (* 100. (- 1 (memory-usage ram)))))))
+             (format "~8o  " (format "~3,1f%" (* 100. (memory-usage ram))))))
       (if (checks asm registers ram)
           (set! result (string-append result "ok"))
           (begin
@@ -1119,7 +1119,7 @@
       (when (< n size)
         (scan (+ 1 n) (if (= 0 (bytevector-u8-ref ram n))
                           (+ 1 run) 0))))
-    (/ longest-run size)))
+    (- 1 (/ longest-run size))))
 
 (run-l5 "expr"
         '((fn (main)
@@ -1164,7 +1164,7 @@
 (run-l5 "tail-call"
         '((fn (main) (spin 4095))
           (fn (spin n x) (if (< n x) (spin (+ n x) x) n)))
-        '() (λ (asm registers ram) (> 1. (memory-usage ram))))
+        '() (λ (asm registers ram) (> .01 (memory-usage ram))))
 
 (run-l5 "fib"
         '((fn (main) (fib 21))
@@ -1252,17 +1252,27 @@
  '()
  (λ (asm registers ram) (= 1 (read-register registers 'ret))))
 
-(run-l5
- "lib"
- '((fn (nil? p) (== 0 p))
 
-   (fn (malloc-init) (store 0 0))
-   (fn (mmb-size p) (load (+ p 1)))
+(run-l5
+ "gc"
+ `((fn (nil? p) (== 0 p))
+
+   (fn (mmb-metadata-size) 3)
    (fn (mmb-next p) (load p))
    (fn (mmb-next-set! p addr) (store p addr))
-   (fn (mmb-past p) (+ p (+ 2 (mmb-size p))))
+   (fn (mmb-size p) (load (+ p 1)))
+   (fn (mmb-size-set! p v) (store (+ p 1) v))
+   (fn (mmb-reachable p) (load (+ p 2)))
+   (fn (mmb-reachable-set! p s) (store (+ p 2) s))
+
+   (fn (mmb-data p) (+ p 3))
+   (fn (mmb-past p) (+ (mmb-data p) (mmb-size p)))
+
    (fn (mmb-create! addr size)
-       (store addr 0) (store (+ addr 1) size))
+       (mmb-next-set! addr 0)
+       (mmb-size-set! addr size)
+       (mmb-reachable-set! addr 808))
+
    (fn (mmb-last p) (if (nil? (mmb-next p))
                         p (mmb-last (mmb-next p))))
    (fn (mmb-find-parent from to)
@@ -1277,7 +1287,7 @@
        (= next (mmb-next p))
        (if (nil? next) p
            (prog (= gap (- next (mmb-past p)))
-                 (if (<= (+ 2 size) gap) p
+                 (if (<= (+ (mmb-metadata-size) size) gap) p
                      (malloc-find-space next size)))))
 
    (fn (malloc size)
@@ -1286,18 +1296,95 @@
        (mmb-create! new size)
        (mmb-next-set! new (mmb-next at))
        (mmb-next-set! at new)
-       (+ 2 new))
+       (return
+        (+ (mmb-metadata-size) new)))
 
    (fn (free p)
-       (= p (- p 2))
+       (mmb-reachable-set! p 0)
+       (= p (- p (mmb-metadata-size)))
        (if (nil? p) (return 0) (prog 0))
        (= prev (mmb-find-parent 0 p))
        (mmb-next-set! prev (mmb-next p))
        1)
 
+   (fn (boehm-reset-reachability root)
+       (= next (mmb-next root))
+       (if (nil? next) 0
+           (prog (mmb-reachable-set! next 0)
+                 (boehm-reset-reachability next))))
+   (fn (boehm-scan-reachable-region block)
+       (= a (mmb-data block))
+       (= b (mmb-past block))
+       (= found 0)
+       (while (!= a b)
+              (= new (boehm-reachable (load a)))
+              (if (== new 0) 0 (= found 1))
+              (++ a))
+       found)
+   (fn (boehm-valid-block block)
+       (if (< 2 block)
+           (if (< block ,(/ ram-size 2)) 1 0) 0))
+
+   (fn (boehm-reachable-scan root block)
+       (if (== root block)
+           (prog
+            (= already-reachable
+               (== 808 (mmb-reachable block)))
+            (mmb-reachable-set! block 808)
+            (if already-reachable 0
+                ;; scan for further live pointers
+                (boehm-scan-reachable-region block)))
+           (if (nil? (mmb-next root)) 0
+               (boehm-reachable-scan (mmb-next root) block))))
+   (fn (boehm-reachable addr)
+       (= block (- addr (mmb-metadata-size)))
+       (if (boehm-valid-block block)
+           (boehm-reachable-scan 0 block)
+           0))
+   (fn (munge-stack s k)
+       (if (< s 1131) 1131
+           (+ k (- k (munge-stack (- s k) k)))))
+   (fn (boehm-free-unreachable p)
+       (= next (mmb-next p))
+       (if (nil? next) 0
+           (prog
+            (= live? (== 808 (mmb-reachable next)))
+            (if live?
+                (boehm-free-unreachable next)
+                (prog (free (+ next (mmb-metadata-size)))
+                      (boehm-free-unreachable p))))))
+   (fn (boehm-gc)
+       (munge-stack 2771 113)
+       (= root 0)
+       (boehm-reset-reachability 0)
+       (mmb-reachable-set! root 808)
+       (= stack ,(/ ram-size 2))
+       (while (< stack ,ram-size)
+              (boehm-reachable (load stack))
+              (++ stack))
+       (boehm-free-unreachable root))
+
+   (fn (gc-init) (mmb-size-set! 0 2))
+   (fn (gc-alloc size)
+       (= allocated (+ size (load 4)))
+       (store 4 allocated)
+       (if (< allocated 128) 0
+           (prog (store 4 0)
+                 (boehm-gc)))
+       (malloc size))
+
+   (fn (memset p n v)
+       (= a p)
+       (= b (+ a n))
+       (while (!= a b)
+              (store a v)
+              (+= a 1))
+       p)
+
+
    (fn (nil) 0)
    (fn (cons x l)
-       (= cell (malloc 2))
+       (= cell (gc-alloc 2))
        (store cell x)
        (store (+ 1 cell) l)
        cell)
@@ -1335,10 +1422,25 @@
 
    (fn (even? x) (== 0 (mod x 2)))
 
-   (fn (main) (malloc-init)
+
+   (fn (main) (gc-init)
        (sum (map (:fn-addr double)
                  (filter (:fn-addr even?)
-                         (iota 10))))))
+                         (iota 20))))
+
+       (sum (map (:fn-addr double)
+                 (filter (:fn-addr even?)
+                         (iota 20))))
+
+       (sum (map (:fn-addr double)
+                 (filter (:fn-addr even?)
+                         (iota 20))))
+
+       (sum (map (:fn-addr double)
+                 (filter (:fn-addr even?)
+                         (iota 20))))
+
+       0))
  '()
  (λ (asm registers ram)
-   (= 40 (read-register registers 'ret))))
+   (> .6 (memory-usage ram))))
