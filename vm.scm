@@ -123,6 +123,8 @@
          instr
          [const (n) (assert (>= 12 (fxlength n)))
                 (write-register 'const n)]
+         [nconst (n) (assert (>= 12 (fxlength n)))
+                 (write-register 'const (fx+ 1 (fxxor n #xffff)))]
          [mov (mode a b) (assert (member mode '(y cond)))
               (let* ([true (= 1 (fxand 1 (read-register registers 'cond)))]
                      [condition (or (eq? mode 'y) true)])
@@ -716,8 +718,7 @@
                    [register (spill-reuse! var)])
               (if (not register)
                   (scan (cdr asm))
-                  (append `((const ,addr)
-                            (alu neg const zero)
+                  (append `((nconst ,addr)
                             (alu add const frame)
                             (store const ,register))
                           (scan (cdr asm)))))))]
@@ -767,8 +768,7 @@
                          (if A-available '()
                              (let* ([addr (spill-frame-offset A)]
                                     [register (spill-restore! A)])
-                               `((const ,addr)
-                                 (alu neg const zero)
+                               `((nconst ,addr)
                                  (alu add const frame)
                                  (load ,register const))))]
                         [A-pos (or A-direct (spill-reuse! A))])
@@ -792,8 +792,7 @@
                       (if A-available '()
                           (let* ([addr (spill-frame-offset A)]
                                  [register (spill-reuse! A)])
-                            `((const ,addr)
-                              (alu neg const zero)
+                            `((nconst ,addr)
                               (alu add const frame))))
                       ;; write B back to A's former spill memory
                       (if A-direct '() `((store const A-pos))))])
@@ -814,8 +813,7 @@
                  (if (or (direct-register var) (spill-reuse! var)) '()
                      (let* ([addr (spill-frame-offset var)]
                             [register (spill-restore! var)])
-                       `((const ,addr)
-                         (alu neg const zero)
+                       `((nconst ,addr)
                          (alu add const frame)
                          (load ,register const)))))
                references)]
@@ -850,10 +848,15 @@
         (append
          (if (not const-ref) (list instruction)
              (let ([val (cadr const-ref)])
-               (if (eq? 0 val)
-                   (list (subst 'zero const-ref instruction))
-                   (list `(const ,(cadr const-ref))
-                         (subst 'const const-ref instruction)))))
+               (cond
+                [(eq? 0 val)
+                 (list (subst 'zero const-ref instruction))]
+                [(and (number? val) (> 0 val))
+                 (list `(nconst ,(abs (cadr const-ref)))
+                       (subst 'const const-ref instruction))]
+                [else
+                 (list `(const ,(cadr const-ref))
+                       (subst 'const const-ref instruction))])))
          (asm-load-consts (cdr asm))))))
 
 (define (asm-pattern-optimizations asm)
