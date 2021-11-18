@@ -124,7 +124,8 @@
          [const (n) (assert (>= 12 (fxlength n)))
                 (write-register 'const n)]
          [nconst (n) (assert (>= 12 (fxlength n)))
-                 (write-register 'const (fx+ 1 (fxxor n #xffff)))]
+                 (write-register 'const
+                                 (fxand #xffff (fx+ 1 (fxxor n #xffff))))]
          [mov (mode a b) (assert (member mode '(y cond)))
               (let* ([true (= 1 (fxand 1 (read-register registers 'cond)))]
                      [condition (or (eq? mode 'y) true)])
@@ -200,6 +201,60 @@
         (exec)))
 
     (values registers ram cycles)))
+
+
+
+(define (binary instructions)
+  (define (reg-args a b)
+    (fxior (fxsll (register-name a) 4)
+           (register-name b)))
+  (map
+   (λ (instr)
+     (record-case
+      instr
+      [const (n) (assert (>= 12 (fxlength n))) n]
+      [nconst (n) (assert (>= 12 (fxlength n)))
+              (fxior (fxsll #b1111 12)
+                     (fxand #b0000111111111111
+                            (fx+ 1 (fxxor n #xffff))))]
+      [mov (mode a b) (assert (member mode '(y cond)))
+           (fxior (fxsll #b0001 12)
+                  (fxsll (case mode [y 1] [cond 0]) 8)
+                  (reg-args a b))]
+      [store (a r) (fxior (fxsll #b0010 12)
+                          (reg-args a r))]
+
+      [load (r a) (fxior (fxsll #b0011 12)
+                         (reg-args r a))]
+
+      [alu (op a b)
+           (fxior (fxsll #b0100 12)
+                  (fxsll (case op
+                           [add 0] [sub 1] [inc 2] [dec 3] [neg 4]
+                           [xor 5] [or 6] [and 7] [not 8])
+                         8)
+                  (reg-args a b))]
+
+      [cmp (op a b)
+           (fxior (fxsll #b0111 12)
+                  (fxsll (case op
+                           [zero 0] [eq 1] [neq 2]
+                           [less 3] [less-or-eq 4])
+                         8)
+                  (reg-args a b))]
+
+      [shift (direction a b)
+             (assert (member direction '(l r)))
+             (fxior (fxsll #b1010 12)
+                    (fxsll (case direction [l 0] [r 1]) 8)
+                    (reg-args a b))]
+
+      [flip (a b) (fxior (fxsll #b1011 12)
+                         (reg-args a b))]
+
+      [else (error "bin" (format "unknown op ~s" (car instr)))]))
+
+   instructions))
 
 
 (define (assemble asm)
@@ -1375,7 +1430,13 @@
   (let* ([asm (compile code)]
          [bin (assemble asm)]
          [result (format "~16a ~8s" name (length bin))])
+
     ;; (print-asm asm)
+    ;; (for-each
+    ;;  (λ (a b)
+    ;;    (printf "~16,b ~s\n" b a))
+    ;;  bin (binary bin))
+
     (let-values ([(registers ram cycles) (vm bin data)])
       (set! result
             (string-append
@@ -1564,7 +1625,7 @@
    (fn (mmb-create! addr size)
        (mmb-next-set! addr 0)
        (mmb-size-set! addr size)
-       (mmb-reachable-set! addr 808))
+       (mmb-reachable-set! addr -1))
 
    (fn (mmb-last p) (if (nil? (mmb-next p))
                         p (mmb-last (mmb-next p))))
@@ -1589,8 +1650,7 @@
        (mmb-create! new size)
        (mmb-next-set! new (mmb-next at))
        (mmb-next-set! at new)
-       (return
-        (+ (mmb-metadata-size) new)))
+       (return (+ (mmb-metadata-size) new)))
 
    (fn (free p)
        (mmb-reachable-set! p 0)
@@ -1618,15 +1678,16 @@
        (if (< 2 block)
            (if (< block ,(/ ram-size 2)) 1 0) 0))
 
+   (fn (marked-reachable? addr)
+       (== (mmb-reachable addr) -1))
+
    (fn (boehm-reachable-scan root block)
        (if (== root block)
-           (prog
-            (= already-reachable
-               (== 808 (mmb-reachable block)))
-            (mmb-reachable-set! block 808)
-            (if already-reachable 0
-                ;; scan for further live pointers
-                (boehm-scan-reachable-region block)))
+           (if (marked-reachable? block) 0
+               (prog
+                 (mmb-reachable-set! block -1)
+                 ;; scan for further live pointers
+                 (boehm-scan-reachable-region block)))
            (if (nil? (mmb-next root)) 0
                (boehm-reachable-scan (mmb-next root) block))))
    (fn (boehm-reachable addr)
@@ -1640,17 +1701,15 @@
    (fn (boehm-free-unreachable p)
        (= next (mmb-next p))
        (if (nil? next) 0
-           (prog
-            (= live? (== 808 (mmb-reachable next)))
-            (if live?
-                (boehm-free-unreachable next)
-                (prog (free (+ next (mmb-metadata-size)))
-                      (boehm-free-unreachable p))))))
+           (if (marked-reachable? next)
+               (boehm-free-unreachable next)
+               (prog (free (+ next (mmb-metadata-size)))
+                     (boehm-free-unreachable p)))))
    (fn (boehm-gc)
        (munge-stack 2771 113)
        (= root 0)
        (boehm-reset-reachability 0)
-       (mmb-reachable-set! root 808)
+       (mmb-reachable-set! root -1)
        (= stack ,(/ ram-size 2))
        (while (< stack ,ram-size)
               (boehm-reachable (load stack))
@@ -1666,7 +1725,7 @@
                  (boehm-gc)))
        (malloc size))
 
-   (fn (nil) 0)
+   (fn (nil) (:fn-addr nil))
    (fn (cons x l)
        (= cell (gc-alloc 2))
        (store cell x)
@@ -1674,7 +1733,7 @@
        cell)
    (fn (car l) (load l))
    (fn (cdr l) (load (+ 1 l)))
-   (fn (null? l) (nil? l))
+   (fn (null? l) (== (:fn-addr nil) l))
 
    (fn (map f l)
        (if (null? l) (nil)
