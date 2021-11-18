@@ -436,9 +436,9 @@
   (define (macro-ir env ir name args)
     (case name
       [:fn-addr
-       (let* ([fn (car args)] [addr (function-label fn)]
+       (let* ([fn (car args)]
               [val (symgen (format "f-~s" fn))])
-         (values (append `((value ,val (fn-addr ,addr))) ir)
+         (values (append `((value ,val (fn-addr ,fn))) ir)
                  val))]
       [else (error "macro-ir" (format "unknown macro ~s" name))]))
 
@@ -941,6 +941,7 @@
   (define inline-stack '())
   (define label-prefix "")
   (define inline-fail)
+  (define function-references '())
 
   (define asm '())
   (define dead-code #f)
@@ -995,16 +996,23 @@
                            [(> >= zero) (void)])]
                  [a (reference! fn line a)]
                  [b (reference! fn line b)]
-                 [out (reference! fn line out-var)])
-            (emit! `((mov y ,out ,a)
-                     (cmp ,op ,out ,b)
-                     (mov y ,out cond))))]
+                 [out (reference! fn (+ 1 line) out-var)])
+            (cond [(equal? out a) (emit! `((cmp ,op ,out ,b)
+                                           (mov y ,out cond)))]
+                  [(equal? out b) (emit! `((mov y cond ,a)
+                                           (cmp ,op cond ,out)
+                                           (mov y ,out cond)))]
+                  [else (emit! `((mov y ,out ,a)
+                                 (cmp ,op ,out ,b)
+                                 (mov y ,out cond)))]))]
+
      [load (addr) (let* ([addr (reference! fn line addr)]
-                         [out (reference! fn line out-var)])
+                         [out (definition! fn (+ 1 line) out-var)])
                     (emit! `((load ,out ,addr))))]
 
      [fn-addr (function)
-              (emit! `((const ,function)
+              (set! function-references (cons function function-references))
+              (emit! `((const ,(function-label function))
                        (mov y ,(reference! fn line out-var) const)))]
 
      [(call addr-call)
@@ -1025,14 +1033,16 @@
       (define fn-addr
         (if address-call?
             'cond `(const-ref ,(function-label function))))
-      (define-values (restore-asm restore-vars restore-regs)
+      (define-values (restore-asm restore-vars restore-regs restore-refs)
         (values asm
                 (hashtable-copy variables #t)
-                (hashtable-copy registers #t)))
+                (hashtable-copy registers #t)
+                function-references))
       (define (restore)
         (set! asm restore-asm)
         (set! variables restore-vars)
-        (set! registers restore-regs))
+        (set! registers restore-regs)
+        (set! function-references restore-refs))
 
       (let* ([call-cost (call/cc (λ (cc) (λ (x) (restore) (cc x))))]
              [inline-retry (call/cc (λ (cc) cc))])
@@ -1046,7 +1056,7 @@
             (fluid-let
                 ([inline-context (cons* return-var ret-addr args)]
                  [label-prefix (symbol->string (symgen function))]
-                 [frozen (cons out-var (append frozen (live fn line)))]
+                 [frozen (append frozen (live fn line))]
                  [inline-stack (cons fn inline-stack)]
                  [inline-tail-call (and inline-tail-call tail-call)]
                  [inline-fail (λ () (restore) (inline-retry #f))])
@@ -1056,8 +1066,7 @@
               (when (< call-cost
                        (- (approx-code-length asm)
                           (approx-code-length restore-asm)))
-                (inline-fail))
-              ))]
+                (inline-fail))))]
 
          [(and tail-call inline-tail-call)
           ;; argument shuffle:
@@ -1115,7 +1124,8 @@
             (when (not (number? call-cost))
               (call-cost (- (approx-code-length asm)
                             (approx-code-length restore-asm))))
-
+            (when (not address-call?)
+              (set! function-references (cons function function-references)))
             (die!))]
 
          [else
@@ -1169,22 +1179,32 @@
             (call-cost (- (approx-code-length asm)
                           (approx-code-length restore-asm))))
 
+          (when (not address-call?)
+            (set! function-references (cons function function-references)))
+
           ]))]
 
      [const (value) (let* ([out (reference! fn line out-var)])
                       (emit! `((mov y ,out (const-ref ,value)))))]
-     [+ (a b) (let* ([a (reference! fn line a)]
-                     [b (reference! fn line b)]
-                     [out (reference! fn line out-var)])
-                (emit! `((mov y ,out ,a)
-                         (write ,out)
-                         (alu add ,out ,b))))]
-     [- (a b) (let* ([a (reference! fn line a)]
-                     [b (reference! fn line b)]
-                     [out (reference! fn line out-var)])
-                (emit! `((mov y ,out ,a)
-                         (write ,out)
-                         (alu sub ,out ,b))))]
+     [+ (a b)
+        (let* ([a (reference! fn line a)]
+               [b (reference! fn line b)]
+               [out (reference! fn (+ 1 line) out-var)])
+          (cond [(equal? out a) (emit! `((alu add ,a ,b)))]
+                [(equal? out b) (emit! `((alu add ,b ,a)))]
+                [else (emit! `((mov y ,out ,a)
+                               (write ,out)
+                               (alu add ,out ,b)))]))]
+     [- (a b)
+        (let* ([a (reference! fn line a)]
+               [b (reference! fn line b)]
+               [out (reference! fn (+ 1 line) out-var)])
+          (cond [(equal? out a) (emit! `((alu sub ,a ,b)))]
+                [(equal? out b) (emit! `((alu neg ,b zero)
+                                         (alu add ,b ,a)))]
+                [else (emit! `((mov y ,out ,a)
+                               (write ,out)
+                               (alu sub ,out ,b)))]))]
 
      [else (error "asm" (format "unknown builtin ~s" instr))]))
 
@@ -1198,8 +1218,7 @@
         (record-case
          instr
          [set (var val) (let* ([val (reference! fn line val)]
-                               [var (definition! fn line var)])
-                          ;; dont load spilled target for set
+                               [var (definition! fn (+ 1 line) var)])
                           (emit! `((mov y ,var ,val)
                                    (write ,var))))]
          [def () (void)]
@@ -1218,9 +1237,10 @@
                                      label-prefix (symbol->string jump)))
                             (mov cond ip const))))]
 
-         [jump (jump) (emit! `((const ,(string-append
-                                        label-prefix (symbol->string jump)))
-                               (mov y ip const)))]
+         [jump (jump)
+               (emit! `((const ,(string-append
+                                 label-prefix (symbol->string jump)))
+                        (mov y ip const)))]
 
          [label (id)
                 (undie!)
@@ -1245,8 +1265,7 @@
                             [val (reference! fn line val)]
                             [var (reference! fn line var)])
                        (emit! `((mov y ,var ,val)
-                                (write ,var))))
-                     )]
+                                (write ,var)))))]
 
          [function-body
           (_) (when (not inline-context)
@@ -1258,18 +1277,17 @@
                        (begin
                          (emit! `(;; restore caller's stack
                                   ;; pop the stack arguments
-                                  (mov y cond ret)
+                                  (mov y v6 ret)
                                   (mov y stack frame)
                                   (alu add stack (const-ref ,argument-frame-size))
                                   (mov y ret ,val)
-                                  (mov y ip cond)))
+                                  (mov y ip v6)))
                          (die!))
                        (begin
                          (emit! `((mov y ,(car inline-context) ,val)
                                   (write ,(car inline-context))
                                   (const ,(cadr inline-context))
-                                  (mov y ip const))))
-                       ))]
+                                  (mov y ip const))))))]
 
          [print (x) (emit! `((print ,(reference! fn line x))))]
 
@@ -1278,7 +1296,7 @@
       (next fn (cdr ir) (+ line 1))))
 
   (next function (symbol-hashtable-ref ir function #f) 0)
-  (reverse asm))
+  (cons* (reverse asm) function-references))
 
 (define (generate-asm ir)
   (define (ir-fn-name fn) (cadr (car fn)))
@@ -1290,15 +1308,27 @@
                (symbol-hashtable-set! functions name ir)
                (symbol-hashtable-set! lifetimes name (lifetime-analysis ir)))
              names ir)]
-         [asm-fns
-          (map (λ (name)
-                 (let* ([asm (function-asm name functions lifetimes)]
-                        [asm (asm-register-assignment asm)]
-                        [asm (asm-load-consts asm)]
-                        [asm (asm-pattern-optimizations asm)])
-                   asm))
-               names)]
-         [asm (fold-left append '() asm-fns)])
+         [fn-asm
+          (let scan-call-graph ([queue '(main)] [seen '()])
+            (let* ([name (car queue)]
+                   [asm (function-asm name functions lifetimes)]
+                   [calls (cdr asm)] [asm (car asm)]
+                   [seen (cons name seen)]
+                   [calls (filter (λ (fn) (not (memq fn seen))) calls)]
+                   [calls
+                    (fold-left (λ (calls fn)
+                                 (if (memq fn calls) calls (cons fn calls)))
+                               '() calls)]
+                   [queue (append (cdr queue) calls)]
+                   [seen (append calls seen)]
+                   [asm (asm-register-assignment asm)]
+                   [asm (asm-load-consts asm)]
+                   [asm (asm-pattern-optimizations asm)]
+                   [asm (asm-pattern-optimizations asm)])
+              (cons asm (if (null? queue) '()
+                            (scan-call-graph queue seen)))))]
+         [asm (fold-left append '() fn-asm)])
+
     (append `((comment 'init)
               (const ".halt")
               (mov y ret const)
@@ -1306,7 +1336,6 @@
               (mov y frame const)
               (mov y stack const)
               (const ,(function-label 'main))
-              (alu add zero zero)
               (mov y ip const))
             asm
             '((label ".halt")))))
