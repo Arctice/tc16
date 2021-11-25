@@ -3,7 +3,9 @@
 (pretty-one-line-limit 40)
 
 (define enable-tail-calls (make-parameter #t))
+(define enable-inlining (make-parameter #t))
 (define enable-optimizations (make-parameter #t))
+(define enable-fuse-lifetimes (make-parameter #t))
 (define ram-size (make-parameter 1024))
 
 ;; 16-bit word, load-store instruction set
@@ -460,7 +462,7 @@
               [code `((value ,var (- ,a ,b)))])
          (values (append (reverse code) ir) var))]
       [+=
-       (let*-values ([(ir add) (builtin-ir env ir '+ args)])
+       (let*-values ([(ir add) (builtin-ir env ir '+ (reverse args))])
          (builtin-ir env ir '= (list (car args) add)))]
       [-=
        (let*-values ([(ir add) (builtin-ir env ir '- args)])
@@ -723,13 +725,207 @@
          predecessors))))
   lifetimes)
 
+(define (asm-register-allocation lifetimes asm)
+  (define registers (make-eqv-hashtable))
+  (define variables (make-hashtable symbol-hash symbol=?))
+
+  (define local-vars-referenced (make-hashtable symbol-hash symbol=?))
+  (define inline-stack '())
+
+  (define (cleanup-inline-locals f)
+    (let ([a '()])
+      (for-each
+       (λ (var)
+         (let ([stored (symbol-hashtable-ref variables var #f)])
+           (when stored
+             (symbol-hashtable-delete! variables var)
+             (when (eq? var (hashtable-ref registers stored 'nil))
+               (hashtable-delete! registers stored)))))
+       (symbol-hashtable-ref local-vars-referenced f '()))
+      a))
+  (define (enter-inline! fn ir-line)
+    (let ([live-vars
+           (hashtable-ref
+            (symbol-hashtable-ref lifetimes fn (void))
+            ir-line '())])
+      (set! inline-stack (cons (cons* fn ir-line) inline-stack))
+      '()
+      ))
+  (define (leave-inline! fn inlined-function)
+    (set! inline-stack (cdr inline-stack))
+    (cleanup-inline-locals inlined-function))
+
+
+  (define (live fn line)
+    (append
+     (fold-left append '()
+                (map (λ (inline-context)
+                       (hashtable-ref
+                        (symbol-hashtable-ref
+                         lifetimes (car inline-context) (void))
+                        (cdr inline-context) '()))
+                     inline-stack))
+     (hashtable-ref (symbol-hashtable-ref lifetimes fn (void))
+                    line '())))
+
+  (define (evictable fn line)
+    (append
+     (fold-left append '()
+                (map (λ (inline-context)
+                       (hashtable-ref
+                        (symbol-hashtable-ref
+                         lifetimes (car inline-context) (void))
+                        (+ 1 (cdr inline-context)) '()))
+                     inline-stack))
+     (hashtable-ref (symbol-hashtable-ref lifetimes fn (void))
+                    (+ 1 line) '())))
+
+
+  (define next-free-register
+    (if lifetimes
+        (λ (fn ir-line)
+          (let ([live-variables (live fn ir-line)])
+            (let scan ([r 0])
+              (let ([stored-var (hashtable-ref registers r 'nil)])
+                (if (memq stored-var live-variables)
+                    (scan (+ r 1)) r)))))
+        (let ([id 0])
+          (λ _ (set! id (+ 1 id)) id))))
+
+  (define (reference! fn ir-line var)
+    (cond
+     [(and (pair? var) (eq? (car var) 'const-ref)) var]
+     [else
+      (symbol-hashtable-update! local-vars-referenced fn
+                                (λ (vars) (cons var vars)) '())
+      (let ([stored (symbol-hashtable-ref variables var #f)])
+        (if stored `(ref ,stored)
+            (let ([register (next-free-register fn ir-line)])
+              (symbol-hashtable-delete!
+               variables (hashtable-ref registers register 'nil))
+              (hashtable-set! registers register var)
+              (symbol-hashtable-set! variables var register)
+              `(ref ,register))))]))
+
+  (define (fuse-lifetimes line)
+    (if (or (not (enable-fuse-lifetimes))
+            (not (and (eq? 'mov (car line)) (eq? 'y (cadr line))))) #f
+            (let* ([refs (cddr line)]
+                   [a (car refs)] [b (cadr refs)]
+                   [is-def (and (pair? a) (eq? 'def (car a)))]
+                   [from-var (and (pair? b) (eq? 'ref (car b))
+                                  (not (pair? (cadr b))))])
+              (if (not (and is-def from-var)) #f
+                  (let* ([fn-a (list-ref a 2)]
+                         [fn-b (list-ref b 2)]
+                         [ir-line-a (list-ref a 3)]
+                         [ir-line-b (list-ref b 3)]
+                         [val-dies
+                          (not (memq (cadr b) (evictable fn-b ir-line-b)))]
+                         [new-def
+                          (not (memq (cadr a) (live fn-a (- ir-line-a 1))))])
+                    (if (not (and new-def val-dies)) #f
+                        (let* ([var (cadr a)]
+                               [ref (reference! fn-b ir-line-b (cadr b))]
+                               [is-inline (not (eq? fn-a fn-b))])
+                          (hashtable-set! registers (cadr ref) var)
+                          (symbol-hashtable-set! variables var (cadr ref))
+                          (list `(mov y ,ref ,ref)))))))))
+
+  (define (allocate-refs line)
+    (let* ([ref-indices
+            (filter (λ (index)
+                      (let ([word (list-ref line index)])
+                        (and (pair? word)
+                             (memq (car word) '(def ref)))))
+                    (enumerate line))]
+           [refs (map (λ (index) (list-ref line index)) ref-indices)]
+           [refs
+            (map (λ (ref) ;; resolve refs
+                   (if (eq? 'def (car ref)) ref
+                       (let* ([var (cadr ref)]
+                              [location (cddr ref)]
+                              [fn (car location)]
+                              [line (cadr location)])
+                         (reference! fn line var))))
+                 refs)]
+           [refs
+            (map (λ (ref) ;; resolve defs
+                   (if (not (eq? 'def (car ref))) ref
+                       (let* ([var (cadr ref)]
+                              [location (cddr ref)]
+                              [fn (car location)]
+                              [line (cadr location)])
+                         `(def ,(cadr (reference! fn line var))))))
+                 refs)]
+           [line
+            (let merge-refs ([line line] [index 0]
+                             [refs refs] [ref-indices ref-indices])
+              (cond [(null? refs) line]
+                    [(null? line) line]
+                    [(= index (car ref-indices))
+                     (cons (car refs)
+                           (merge-refs (cdr line) (+ 1 index)
+                                       (cdr refs) (cdr ref-indices)))]
+                    [else
+                     (cons (car line)
+                           (merge-refs (cdr line) (+ 1 index)
+                                       refs ref-indices))]))])
+      (append (list line))))
+
+  (define (live-registers fn line)
+    (map (λ (var) (symbol-hashtable-ref variables var (void)))
+         (filter (λ (var) (symbol-hashtable-contains? variables var))
+                 (live fn line))))
+
+  (define call-saved '())
+
+  (let scan ([asm asm])
+    (if (null? asm) '()
+        (let* ([line (car asm)])
+          (case (car line)
+            [inline
+             (enter-inline! (cadr line) (caddr line))
+             (scan (cdr asm))]
+            [inline-end
+             (let ([x (leave-inline! (cadr line) (caddr line))])
+               (append x (scan (cdr asm))))]
+            [register-argument
+             (let* ([register (cadr line)]
+                    [var (caddr line)])
+               (hashtable-set! registers register var)
+               (symbol-hashtable-set! variables var register)
+               (scan (cdr asm)))]
+            [call-save-registers
+             (let* ([fn (cadr line)] [ir-line (caddr line)]
+                    [live-variables (live-registers fn ir-line)]
+                    [save
+                     `((comment ,(format
+                                  "call-save ~s ~s"
+                                  live-variables
+                                  (map (λ (r) (hashtable-ref registers r #f))
+                                       live-variables)))
+                       (call-save-registers . ,live-variables))])
+               (set! call-saved live-variables)
+               (append save (scan (cdr asm))))]
+            [call-restore-registers
+             (cons `(call-restore-registers . ,call-saved)
+                   (scan (cdr asm)))]
+            [else
+             (let ([line
+                    (or (fuse-lifetimes line)
+                        (allocate-refs line))])
+               (append line (scan (cdr asm))))])))))
 
 (define (asm-register-assignment asm)
+  (define registers-only #f)
+  (define spill-retry #f)
   (define spill-slots '((v6 . #f) (v7 . #f)))
   (define (evict-spills!)
     (set! spill-slots (map (λ (slot) (cons* (car slot) #f))
                            spill-slots)))
   (define (spill-reuse! var)
+    (when registers-only (spill-retry))
     (let ([recent-use
            (find (λ (slot) (eqv? var (cdr slot))) spill-slots)])
       (if (not recent-use) #f
@@ -737,6 +933,7 @@
                                          (remq recent-use spill-slots)))
                  (car recent-use)))))
   (define (spill-restore! var)
+    (when registers-only (spill-retry))
     (or (spill-reuse! var)
         (let* ([cutoff (- (length spill-slots) 1)]
                [evicted (list-ref spill-slots cutoff)])
@@ -746,13 +943,14 @@
 
   (define highest-frame-offset 0)
 
-  (define max-direct-register (- 7 (length spill-slots)))
+  (define max-direct-registers (- 7 (length spill-slots)))
   (define (spill-frame-offset r)
-    (let ([position (- r max-direct-register)])
+    (when registers-only (spill-retry))
+    (let ([position (- r max-direct-registers)])
       (set! highest-frame-offset (max position highest-frame-offset))
       position))
   (define (direct-register var)
-    (if (< max-direct-register var) #f
+    (if (< max-direct-registers var) #f
         (string->symbol (format "v~s" var))))
 
   (define (scan asm)
@@ -780,7 +978,7 @@
                           (scan (cdr asm)))))))]
 
      [(eq? (caar asm) 'call-save-registers)
-      (let ([live (cadr (car asm))])
+      (let ([live (cdr (car asm))])
         (append
          (fold-left
           append '()
@@ -792,7 +990,7 @@
          (scan (cdr asm))))]
 
      [(eq? (caar asm) 'call-restore-registers)
-      (let ([live (cadr (car asm))])
+      (let ([live (cdr (car asm))])
         (append
          (fold-left
           append '()
@@ -805,11 +1003,11 @@
 
      [(eq? (caar asm) 'call-register-arguments)
       (let* ([args (cdr (car asm))]
+             [args (map cadr args)]
              [moved (make-vector 1024 #f)]
              [stored (make-vector 1024 #f)])
         (for-each (λ (r) (vector-set! stored r r)) args)
         (append
-         `((comment ,(format "swap ~s" args)))
          (fold-left
           (λ (asm current expected)
             (append
@@ -890,7 +1088,14 @@
         (append loads (cons instruction
                             (scan (cdr asm)))))]))
 
-  (let ([asm (scan asm)])
+  (let* ([try-direct-only (call/cc (λ (cc) (λ () (cc #f))))]
+         [asm
+          (if try-direct-only
+              (fluid-let ([max-direct-registers 7]
+                          [registers-only #t]
+                          [spill-retry try-direct-only])
+                (scan asm))
+              (scan asm))])
     (subst highest-frame-offset ':frame-size asm)))
 
 
@@ -1043,12 +1248,15 @@
                 (append (substitute-vars substitutions new)
                         (scan asm))))))))
 
-(define (approx-code-length code)
-  (length
-   (filter (λ (i) (not (memq (car i) '(comment label))))
-           (asm-pattern-optimizations
-            (asm-load-consts
-             (asm-register-assignment code))))))
+(define (try-optimize asm)
+  (if (not (enable-optimizations)) asm
+      (let optimize ([asm asm] [prev-size (length asm)])
+        (let* ([asm (asm-remove-unreachable-code asm)]
+               [asm (asm-remove-unused-labels asm)]
+               [asm (asm-pattern-optimizations asm)]
+               [size (length asm)])
+          (if (< size prev-size)
+              (optimize asm size) asm)))))
 
 (define (function-asm function ir lifetimes)
   (define argument-frame-size)
@@ -1064,41 +1272,20 @@
   (define (emit! code)
     (set! asm (append (reverse code) asm)))
 
-  (define frozen '())
-  (define (live fn line)
-    (hashtable-ref (symbol-hashtable-ref lifetimes fn (void))
-                   line '()))
+  (define (ref! fn ir-line var)
+    `(ref ,var ,fn ,ir-line))
+  (define (def! fn ir-line var)
+    `(def ,var ,fn ,ir-line))
 
-  (define registers (make-eqv-hashtable))
-  (define variables (make-hashtable symbol-hash symbol=?))
-  (define next-free-register
-    (if lifetimes
-        (λ (fn ir-line)
-          (let ([live-variables (live fn ir-line)])
-            (let scan ([r 0])
-              (let ([stored-var (hashtable-ref registers r 'nil)])
-                (if (or (memq stored-var live-variables)
-                        (memq stored-var frozen))
-                    (scan (+ r 1))
-                    (begin (symbol-hashtable-delete! variables stored-var)
-                           r))))))
-        (let ([id 0])
-          (λ _ (set! id (+ 1 id)) id))))
-
-  (define (reference! fn ir-line var)
-    (cond
-     [(and (pair? var) (eq? (car var) 'const-ref)) var]
-     [else
-      (let ([stored (symbol-hashtable-ref variables var #f)])
-        (if stored `(ref ,stored)
-            (let ([register (next-free-register fn ir-line)])
-              (hashtable-set! registers register var)
-              (symbol-hashtable-set! variables var register)
-              `(ref ,register))))]))
-
-  (define (definition! fn ir-line var)
-    (let ([ref (reference! fn ir-line var)])
-      `(def ,(cadr ref))))
+  (define (approx-code-length code)
+    (length
+     (filter (λ (i) (not (memq (car i) '(comment label))))
+             (asm-pattern-optimizations
+              (asm-remove-unreachable-code
+               (asm-load-consts
+                (asm-register-assignment
+                 (asm-register-allocation
+                  lifetimes (reverse code)))))))))
 
   (define (builtin fn instr line out-var)
     (record-case
@@ -1107,26 +1294,21 @@
           (let* ([op (case op [== 'eq] [!= 'neq]
                            [< 'less] [<= 'less-or-eq]
                            [(> >= zero) (void)])]
-                 [a (reference! fn line a)]
-                 [b (reference! fn line b)]
-                 [out (reference! fn (+ 1 line) out-var)])
-            (cond [(equal? out a) (emit! `((cmp ,op ,out ,b)
-                                           (mov y ,out cond)))]
-                  [(equal? out b) (emit! `((mov y cond ,a)
-                                           (cmp ,op cond ,out)
-                                           (mov y ,out cond)))]
-                  [else (emit! `((mov y ,out ,a)
-                                 (cmp ,op ,out ,b)
-                                 (mov y ,out cond)))]))]
+                 [a (ref! fn line a)]
+                 [b (ref! fn line b)]
+                 [out (def! fn line out-var)])
+            (emit! `((mov y ,out ,a)
+                     (cmp ,op ,out ,b)
+                     (mov y ,out cond))))]
 
-     [load (addr) (let* ([addr (reference! fn line addr)]
-                         [out (definition! fn (+ 1 line) out-var)])
+     [load (addr) (let* ([addr (ref! fn line addr)]
+                         [out (def! fn (+ 1 line) out-var)])
                     (emit! `((load ,out ,addr))))]
 
      [fn-addr (function)
               (set! function-references (cons function function-references))
               (emit! `((const ,(function-label function))
-                       (mov y ,(reference! fn line out-var) const)))]
+                       (mov y ,(def! fn line out-var) const)))]
 
      [(call addr-call)
       (tail-call function . args)
@@ -1134,48 +1316,43 @@
       (define ret-addr
         (string-append label-prefix
                        (symbol->string (symgen "ret"))))
-      (define live-variables
-        (filter (λ (exists) exists)
-                (map (λ (var) (symbol-hashtable-ref variables var #f))
-                     (append frozen (live fn (+ 1 line))))))
+
       (define fast-argument-count (min 6 (length args)))
       (define register-arguments
-        (map (λ (var) (cadr (reference! fn line var)))
+        (map (λ (var) (ref! fn line var))
              (list-head args fast-argument-count)))
       (define stack-arguments (list-tail args fast-argument-count))
       (define fn-addr
         (if address-call?
             'cond `(const-ref ,(function-label function))))
-      (define-values (restore-asm restore-vars restore-regs restore-refs)
-        (values asm
-                (hashtable-copy variables #t)
-                (hashtable-copy registers #t)
-                function-references))
+      (define-values (restore-asm restore-refs)
+        (values asm function-references))
       (define (restore)
         (set! asm restore-asm)
-        (set! variables restore-vars)
-        (set! registers restore-regs)
         (set! function-references restore-refs))
 
       (let* ([call-cost (call/cc (λ (cc) (λ (x) (restore) (cc x))))]
              [inline-retry (call/cc (λ (cc) cc))])
         (cond
-         [(and (number? call-cost)
+         [(and (enable-inlining)
+               (number? call-cost)
                (< (length inline-stack) 3)
                inline-retry
                (not address-call?)
-               (not (memq fn inline-stack)))
-          (let ([return-var (reference! fn line out-var)])
+               (not (find (λ (frame) (eq? frame fn)) inline-stack)))
+          (let ([return-var (def! fn line out-var)]
+                [args (map (λ (val) (ref! fn line val)) args)])
             (fluid-let
                 ([inline-context (cons* return-var ret-addr args)]
                  [label-prefix (symbol->string (symgen function))]
-                 [frozen (append frozen (live fn line))]
-                 [inline-stack (cons fn inline-stack)]
+                 [inline-stack (cons (cons* fn line) inline-stack)]
                  [inline-tail-call (and inline-tail-call tail-call)]
                  [inline-fail (λ () (restore) (inline-retry #f))])
-              (emit! `((comment ,(format "inline ~s" function))))
+              (emit! `((comment ,(format "inline ~s" function))
+                       (inline ,fn ,line)))
               (next function (symbol-hashtable-ref ir function #f) 0)
-              (emit! `((label ,ret-addr)))
+              (emit! `((label ,ret-addr)
+                       (inline-end ,fn ,function)))
               (when (< call-cost
                        (- (approx-code-length asm)
                           (approx-code-length restore-asm)))
@@ -1188,9 +1365,9 @@
           ;; copy those back while growing the frame
           ;; finally move the stack to the beginning of the argument section
           (when address-call?
-            (emit! `((mov y cond ,(reference! fn line function)))))
+            (emit! `((mov y cond ,(ref! fn line function)))))
 
-          (let* ([args (map (λ (var) (reference! fn line var))
+          (let* ([args (map (λ (var) (ref! fn line var))
                             stack-arguments)]
                  [safe-args-count
                   (min argument-frame-size (length args))]
@@ -1234,7 +1411,8 @@
                      (alu add stack (const-ref ,(length args)))))
             (emit! `((mov y ip ,fn-addr)))
 
-            (when (not (number? call-cost))
+            (when (and (enable-inlining)
+                       (not (number? call-cost)))
               (call-cost (- (approx-code-length asm)
                             (approx-code-length restore-asm))))
             (when (not address-call?)
@@ -1242,14 +1420,14 @@
 
          [else
           (when address-call?
-            (emit! `((mov y cond ,(reference! fn line function)))))
+            (emit! `((mov y cond ,(ref! fn line function)))))
           ;; save ret, frame
           (emit! `((alu dec stack zero)
                    (store stack ret)
                    (alu dec stack zero)
                    (store stack frame)
                    ;; save registers v0-v7
-                   (call-save-registers ,live-variables)))
+                   (call-save-registers ,fn ,(+ line 1))))
 
           ;; stack arguments
           (when (not (null? stack-arguments))
@@ -1257,7 +1435,7 @@
             (emit! `((mov y ret stack)))
             (for-each
              (λ (arg position)
-               (let ([var (reference! fn line arg)])
+               (let ([var (ref! fn line arg)])
                  (emit! `((alu dec stack zero) (store stack ,var)))))
              stack-arguments (enumerate stack-arguments)))
 
@@ -1277,17 +1455,18 @@
                    ;; return point
                    (label ,ret-addr)))
 
-          (let ([out (definition! fn line out-var)])
+          (let ([out (def! fn line out-var)])
             (emit! `(;; out <- return value
                      (mov y ,out v0)
                      ;; restore registers v0-v7
-                     (call-restore-registers ,live-variables)
+                     (call-restore-registers ,fn ,(+ 1 line))
                      ;; restore previous frame
                      (load frame stack) (alu inc stack zero)
                      ;; restore ret
                      (load ret stack) (alu inc stack zero))))
 
-          (when (not (number? call-cost))
+          (when (and (enable-inlining)
+                     (not (number? call-cost)))
             (call-cost (- (approx-code-length asm)
                           (approx-code-length restore-asm))))
 
@@ -1296,27 +1475,23 @@
 
           ]))]
 
-     [const (value) (let* ([out (reference! fn line out-var)])
+     [const (value) (let* ([out (def! fn line out-var)])
                       (emit! `((mov y ,out (const-ref ,value)))))]
      [+ (a b)
-        (let* ([a (reference! fn line a)]
-               [b (reference! fn line b)]
-               [out (reference! fn (+ 1 line) out-var)])
-          (cond [(equal? out a) (emit! `((alu add ,a ,b)))]
-                [(equal? out b) (emit! `((alu add ,b ,a)))]
-                [else (emit! `((mov y ,out ,a)
-                               (write ,out)
-                               (alu add ,out ,b)))]))]
+        (let* ([a (ref! fn line a)]
+               [b (ref! fn line b)]
+               [out (def! fn line out-var)])
+          (emit! `((mov y ,out ,a)
+                   (write ,out)
+                   (alu add ,out ,b))))]
+
      [- (a b)
-        (let* ([a (reference! fn line a)]
-               [b (reference! fn line b)]
-               [out (reference! fn (+ 1 line) out-var)])
-          (cond [(equal? out a) (emit! `((alu sub ,a ,b)))]
-                [(equal? out b) (emit! `((alu neg ,b zero)
-                                         (alu add ,b ,a)))]
-                [else (emit! `((mov y ,out ,a)
-                               (write ,out)
-                               (alu sub ,out ,b)))]))]
+        (let* ([a (ref! fn line a)]
+               [b (ref! fn line b)]
+               [out (def! fn line out-var)])
+          (emit! `((mov y ,out ,a)
+                   (write ,out)
+                   (alu sub ,out ,b))))]
 
      [else (error "asm" (format "unknown builtin ~s" instr))]))
 
@@ -1324,26 +1499,24 @@
     (when (not (null? ir))
       (let ([instr (car ir)])
         (emit! `((comment ,(format "~s ~s: ~s" fn line instr))))
-        ;; (when (not (null? (live fn line)))
-        ;;   (emit! `((comment ,(format "~~~s" (live fn line))))))
 
         (record-case
          instr
-         [set (var val) (let* ([val (reference! fn line val)]
-                               [var (definition! fn (+ 1 line) var)])
+         [set (var val) (let* ([val (ref! fn line val)]
+                               [var (def! fn (+ 1 line) var)])
                           (emit! `((mov y ,var ,val)
                                    (write ,var))))]
          [def () (void)]
 
          [value (var instr) (builtin fn instr line var)
-                (emit! `((write ,(reference! fn line var))))]
+                (emit! `((write ,(def! fn line var))))]
 
-         [store (addr val) (let* ([val (reference! fn line val)]
-                                  [addr (reference! fn line addr)])
+         [store (addr val) (let* ([val (ref! fn line val)]
+                                  [addr (ref! fn line addr)])
                              (emit! `((store ,addr ,val))))]
 
          [branch (condition jump)
-                 (let ([test (reference! fn line condition)])
+                 (let ([test (ref! fn line condition)])
                    (emit! `((mov y cond ,test)
                             (const ,(string-append
                                      label-prefix (symbol->string jump)))
@@ -1367,15 +1540,15 @@
          [fn-arg
           (var position)
           (if (not inline-context)
-              (let ([val (reference! fn line var)])
-                (when (not (< position 6))
-                  (emit! `((alu dec stack zero)
-                           (load ,val stack)
-                           (write ,val)))))
+              (if (< position 6)
+                  (emit! `((register-argument ,position ,var)))
+                  (let ([val (def! fn line var)])
+                    (emit! `((alu dec stack zero)
+                             (load ,val stack)
+                             (write ,val)))))
               (let* ([inline-args (cddr inline-context)]
                      [val (list-ref inline-args position)]
-                     [val (reference! fn line val)]
-                     [var (reference! fn line var)])
+                     [var (def! fn line var)])
                 (emit! `((mov y ,var ,val)
                          (write ,var)))))]
 
@@ -1384,22 +1557,20 @@
                 (emit! '((alu sub stack (const-ref :frame-size)))))]
 
          [return (var)
-                 (let* ([val (reference! fn line var)])
+                 (let* ([val (ref! fn line var)])
                    (if (not inline-context)
-                       (begin
-                         (emit! `(;; restore caller's stack
-                                  ;; pop the stack arguments
-                                  (mov y v0 ,val)
-                                  (mov y stack frame)
-                                  (alu add stack (const-ref ,argument-frame-size))
-                                  (mov y ip ret))))
-                       (begin
-                         (emit! `((mov y ,(car inline-context) ,val)
-                                  (write ,(car inline-context))
-                                  (const ,(cadr inline-context))
-                                  (mov y ip const))))))]
+                       (emit! `(;; restore caller's stack
+                                ;; pop the stack arguments
+                                (mov y v0 ,val)
+                                (mov y stack frame)
+                                (alu add stack (const-ref ,argument-frame-size))
+                                (mov y ip ret)))
+                       (emit! `((mov y ,(car inline-context) ,val)
+                                (write ,(car inline-context))
+                                (const ,(cadr inline-context))
+                                (mov y ip const)))))]
 
-         [print (x) (emit! `((print ,(reference! fn line x))))]
+         [print (x) (emit! `((print ,(ref! fn line x))))]
 
          [else (error "asm" (format "unknown ir form ~s" instr))]))
 
@@ -1431,6 +1602,7 @@
                                '() calls)]
                    [queue (append (cdr queue) calls)]
                    [seen (append calls seen)]
+                   [asm (asm-register-allocation lifetimes asm)]
                    [asm (asm-register-assignment asm)]
                    [asm (asm-load-consts asm)]
                    [asm (if (not (enable-optimizations)) asm
@@ -1449,15 +1621,7 @@
                  (mov y ip const))
                asm
                '((label ".halt")))]
-         [asm
-          (if (not (enable-optimizations)) asm
-              (let optimize ([asm asm] [prev-size (length asm)])
-                (let* ([asm (asm-remove-unreachable-code asm)]
-                       [asm (asm-remove-unused-labels asm)]
-                       [asm (asm-pattern-optimizations asm)]
-                       [size (length asm)])
-                  (if (< size prev-size)
-                      (optimize asm size) asm))))])
+         [asm (try-optimize asm)])
     asm))
 
 
@@ -1492,6 +1656,7 @@
   (let* ([asm (compile code)]
          [bin (assemble asm)]
          [result (format "~16a ~8s" name (length bin))])
+    (printf "~o\n" result)
 
     ;; (print-asm asm)
     ;; (for-each
@@ -1508,7 +1673,7 @@
     (let-values ([(registers ram cycles) (vm bin data)])
       (set! result
             (string-append
-             result
+             (format "~25a" "")
              (format "~8s" cycles)
              (format "~8o  " (format "~3,1f%" (* 100. (memory-usage ram))))))
       (if (checks asm registers ram)
@@ -1754,9 +1919,9 @@
        (if (== root block)
            (if (marked-reachable? block) 0
                (prog
-                 (mmb-reachable-set! block -1)
-                 ;; scan for further live pointers
-                 (boehm-scan-reachable-region block)))
+                (mmb-reachable-set! block -1)
+                ;; scan for further live pointers
+                (boehm-scan-reachable-region block)))
            (if (nil? (mmb-next root)) 0
                (boehm-reachable-scan (mmb-next root) block))))
    (fn (boehm-reachable addr)
