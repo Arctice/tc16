@@ -3,7 +3,7 @@
 (pretty-one-line-limit 40)
 
 (define enable-tail-calls (make-parameter #t))
-(define enable-inlining (make-parameter #t))
+(define enable-inlining (make-parameter 3))
 (define enable-optimizations (make-parameter #t))
 (define enable-fuse-lifetimes (make-parameter #t))
 (define ram-size (make-parameter 1024))
@@ -29,8 +29,8 @@
 ;; 0 [const | i: 12-bit immediate] i -> const
 ;; 1 [mov | mode | a b] b -> a
 ;;    mode: y or cond
-;; 2 [store | a r] r -> *(a)
-;; 3 [load | r a] *(a) -> r
+;; 2 [load | r a] *(a) -> r
+;; 3 [store | r a] r -> *(a)
 
 ;; 4 [alu | op | a b] a op b -> a
 ;;    op: one of add, sub, neg, inc, dec, xor, or, and, not
@@ -48,8 +48,8 @@
 ;; 11 [flip | a b] swapped bytes of b -> a
 ;; 12
 
-;; 13
-;; 14
+;; 13 [io mode | a b]
+;; 14 [halt]
 ;; 15 [nconst | i: 12-bit immediate] (- i) -> const
 
 ;; pseudo instructions
@@ -91,7 +91,7 @@
         [stride 8])
     (printf "RAM 16-bit x~s\n" size)
     (for-each (λ (row)
-                (printf "~5s: " (* row stride 2))
+                (printf "~5s: " (* row stride 1))
                 (for-each (λ (column)
                             (let* ([addr (* 2 (+ column (* row stride)))]
                                    [val (bytevector-s16-native-ref memory addr)])
@@ -103,18 +103,22 @@
 (define (read-register registers r)
   (bytevector-u16-native-ref registers (* 2 (register-name r))))
 
-(define (vm instructions data)
+(define (vm instructions inputs)
   (let* ([instructions (list->vector instructions)]
          [registers (make-bytevector 32 0)]
          [ram (make-bytevector (* (ram-size) 2) 0)]
+         [outputs '()]
          [cycles 0])
     (define (write-register r val)
       (when (not (eq? r 'zero))
         (bytevector-u16-native-set! registers (* 2 (register-name r)) val)))
-
-    (for-each
-     (λ (v n) (bytevector-u16-native-set! ram (* 2 n) v))
-     data (enumerate data))
+    (define-syntax check
+      (syntax-rules ()
+        [(_ test . reason)
+         (unless test
+           (print-memory ram)
+           (print-registers registers)
+           (assert test))]))
 
     (let exec ()
       (let* ([ip (read-register registers 'ip)]
@@ -122,14 +126,16 @@
         (set! cycles (+ 1 cycles))
         ;; (printf "~4s: ~s \n" ip instr)
 
+        (write-register 'ip (+ 1 (read-register registers 'ip)))
+
         (record-case
          instr
-         [const (n) (assert (>= 12 (fxlength n)))
+         [const (n) (check (>= 12 (fxlength n)))
                 (write-register 'const n)]
-         [nconst (n) (assert (>= 12 (fxlength n)))
+         [nconst (n) (check (>= 12 (fxlength n)))
                  (write-register 'const
-                                 (fxand #xffff (fx+ 1 (fxxor n #xffff))))]
-         [mov (mode a b) (assert (member mode '(y cond)))
+                                 (fxior #xf000 (fx+ 1 (fxxor n #x0fff))))]
+         [mov (mode a b) (check (member mode '(y cond)))
               (let* ([true (= 1 (fxand 1 (read-register registers 'cond)))]
                      [condition (or (eq? mode 'y) true)])
                 (when condition (write-register a (read-register registers b))))]
@@ -137,12 +143,12 @@
          [store (a r)
                 (let ([addr (read-register registers a)]
                       [val (read-register registers r)])
-                  (assert (< addr (ram-size)))
+                  (check (< addr (ram-size)))
                   (bytevector-u16-native-set! ram (* 2 addr) val))]
 
          [load (r a)
                (let ([addr (read-register registers a)])
-                 (assert (< addr (ram-size)))
+                 (check (< addr (ram-size)))
                  (let ([val (bytevector-u16-native-ref ram (* 2 addr))])
                    (write-register r val)))]
 
@@ -174,7 +180,7 @@
                 (write-register 'cond (if val 1 0)))]
 
          [shift (direction a b)
-                (assert (member direction '(l r)))
+                (check (member direction '(l r)))
                 (let* ([x (read-register registers b)]
                        [s (case direction
                             [l (fxsll x 1)]
@@ -191,19 +197,25 @@
 
          [print (v) (printf "~s: ~s\n" v (read-register registers v))]
 
-         [assert-equal
-          (a b) (when (not (equal? (read-register registers a)
-                                   (read-register registers b)))
-                  (print-registers registers)
-                  (print-memory ram)
-                  (error "assert-equal" "vm assertion failure"))]
+         [io (mode a b)
+             (case mode
+               [0 (write-register
+                   a
+                   (if (null? inputs) #xffff
+                       (let ([x (car inputs)])
+                         (set! inputs (cdr inputs))
+                         (fxand #xffff x))))]
+               [1 (set! outputs (cons (read-register registers b) outputs))]
+               [else (printf mode (read-register registers b))])]
+
+         [halt () (check #t)]
 
          [else (error "vm" (format "unknown op ~s" (car instr)))]))
-      (write-register 'ip (+ 1 (read-register registers 'ip)))
+
       (when (< (read-register registers 'ip) (vector-length instructions))
         (exec)))
 
-    (values registers ram cycles)))
+    (values (reverse outputs) registers ram cycles)))
 
 
 
@@ -224,17 +236,18 @@
            (fxior (fxsll #b0001 12)
                   (fxsll (case mode [y 1] [cond 0]) 8)
                   (reg-args a b))]
-      [store (a r) (fxior (fxsll #b0010 12)
-                          (reg-args a r))]
+      [store (a r) (fxior (fxsll #b0011 12)
+                          (reg-args r a))]
 
-      [load (r a) (fxior (fxsll #b0011 12)
+      [load (r a) (fxior (fxsll #b0010 12)
                          (reg-args r a))]
 
       [alu (op a b)
            (fxior (fxsll #b0100 12)
                   (fxsll (case op
-                           [add 0] [sub 1] [inc 2] [dec 3] [neg 4]
-                           [xor 5] [or 6] [and 7] [not 8])
+                           [add 0] [sub 1] [inc 2] [dec 3]
+                           [or 4] [and 5] [xor 6] [not 7]
+                           [neg 15])
                          8)
                   (reg-args a b))]
 
@@ -255,6 +268,14 @@
       [flip (a b) (fxior (fxsll #b1011 12)
                          (reg-args a b))]
 
+      [io (mode a b)
+          (fxior (fxsll #b1101 12)
+                 (fxsll mode 8)
+                 (reg-args a b))]
+
+      [halt () #b1110000000000000]
+
+
       [else (error "bin" (format "unknown op ~s" (car instr)))]))
 
    instructions))
@@ -268,7 +289,7 @@
                 (let* ([inst (car asm)] [name (car inst)]
                        [label
                         (case name
-                          [label (cons* (cadr inst) (- addr 1))]
+                          [label (cons* (cadr inst) addr)]
                           [data (cons* (cadr inst) (caddr inst))]
                           [comment (set! addr (- addr 1)) #f]
                           [else #f])]
@@ -303,14 +324,16 @@
             (get-symbol (environment-parent env) name)))))
 
 (define (macro? name)
-  (memq name '(:fn-addr)))
+  (memq name '(:fn-addr :register)))
 
 (define (builtin? name)
-  (memq name '(def = load store
-                   return
-                   < > <= >= == !=
-                   + - ++ -= +=
-                   print)))
+  (memq name '(def load store return
+                   set! add! sub! inc! dec!
+                   + -
+                   < > <= >= = != zero?
+                   bit-xor bit-or bit-and bit-not
+                   lshift rshift
+                   print halt)))
 
 (define (function-label name)
   (format ".fn-~o" (symbol->string name)))
@@ -329,7 +352,7 @@
      [else
       (let ([form (car expr)])
         (cond
-         [(eq? form '=)
+         [(eq? form 'set!)
           (let* ([lhs (cadr expr)]
                  [rhs (caddr expr)]
                  [rhs (descend env rhs)])
@@ -339,9 +362,9 @@
                     (symbol-hashtable-set!
                      (environment-symbols env) lhs name)
                     `(def ,name ,rhs))
-                  `(= ,var ,rhs))))]
+                  `(set! ,var ,rhs))))]
 
-         [(memq form '(prog while))
+         [(memq form '(begin while))
           (let ([new-scope (new-environment env)]
                 [result (list form)])
             (for-each
@@ -356,6 +379,9 @@
 
          [(eq? form 'if)
           (cons 'if (map (λ (s) (descend env s)) (cdr expr)))]
+
+         [(eq? form 'io)
+          (list 'io (cadr expr) (descend env (caddr expr)))]
 
          [(macro? form) expr]
 
@@ -390,7 +416,7 @@
                       (environment-symbols fn-env) arg name)
                      name))
                  arguments)
-           ,(descend fn-env `(return (prog . ,body))))))
+           ,(descend fn-env `(return (begin . ,body))))))
 
   (let ([ast (cons 'program (map parse-top-level code))])
     (values ast symbol-table)))
@@ -412,7 +438,7 @@
               `(fn ,name ,args ,(descend body)))]
            [(eq? form 'return)
             `(return ,(descend (cadr expr)))]
-           [(eq? form 'prog)
+           [(eq? form 'begin)
             (let ([tail (last-pair expr)])
               (append (list-head expr (- (length expr) 1))
                       (list (descend (car tail)))))]
@@ -430,7 +456,8 @@
            [(eq? form 'call)
             (set-car! (cdr expr) 'tail-call)
             expr]
-           [(memq form '(= while)) expr]
+           [(memq form '(set! while)) expr]
+           [(eq? form 'io) expr]
            [(macro? form) expr]
            [(builtin? form) expr]
            [else (error "tco" (format "a: ~s" form))])
@@ -443,14 +470,14 @@
 (define (generate-ir symbols ast)
   (define (builtin-ir env ir fn args)
     (case fn
-      [=
+      [set!
        (let* ([lhs (car args)] [rhs (cadr args)]
               [ir (cons `(set ,lhs ,rhs) ir)])
          (values ir lhs))]
       [def
        (let* ([name (car args)] [value (cadr args)]
               [ir (cons `(def ,name) ir)])
-         (builtin-ir env ir '= (list name value)))]
+         (builtin-ir env ir 'set! (list name value)))]
       [+
        (let* ([var (symgen "add")]
               [a (car args)] [b (cadr args)]
@@ -461,16 +488,54 @@
               [a (car args)] [b (cadr args)]
               [code `((value ,var (- ,a ,b)))])
          (values (append (reverse code) ir) var))]
-      [+=
-       (let*-values ([(ir add) (builtin-ir env ir '+ (reverse args))])
-         (builtin-ir env ir '= (list (car args) add)))]
-      [-=
+      [add!
+       (let*-values ([(ir add) (builtin-ir env ir '+ args)])
+         (builtin-ir env ir 'set! (list (car args) add)))]
+      [sub!
        (let*-values ([(ir add) (builtin-ir env ir '- args)])
-         (builtin-ir env ir '= (list (car args) add)))]
-      [++
+         (builtin-ir env ir 'set! (list (car args) add)))]
+      [inc!
        (let-values ([(ir one) (descend env ir 1)])
-         (builtin-ir env ir '+= (list (car args) one)))]
-      [(< > <= >= == !=)
+         (builtin-ir env ir 'add! (list (car args) one)))]
+      [dec!
+       (let-values ([(ir one) (descend env ir 1)])
+         (builtin-ir env ir 'sub! (list (car args) one)))]
+      [bit-xor
+       (let* ([var (symgen "xor")]
+              [a (car args)] [b (cadr args)]
+              [code `((value ,var (bit-xor ,a ,b)))])
+         (values (append (reverse code) ir) var))]
+      [bit-or
+       (let* ([var (symgen "or")]
+              [a (car args)] [b (cadr args)]
+              [code `((value ,var (bit-or ,a ,b)))])
+         (values (append (reverse code) ir) var))]
+      [bit-and
+       (let* ([var (symgen "and")]
+              [a (car args)] [b (cadr args)]
+              [code `((value ,var (bit-and ,a ,b)))])
+         (values (append (reverse code) ir) var))]
+      [bit-not
+       (let* ([var (symgen "not")]
+              [a (car args)]
+              [code `((value ,var (bit-not ,a)))])
+         (values (append (reverse code) ir) var))]
+      [lshift
+       (let* ([var (symgen "lshift")]
+              [a (car args)]
+              [code `((value ,var (shift l ,a)))])
+         (values (append (reverse code) ir) var))]
+      [rshift
+       (let* ([var (symgen "rshift")]
+              [a (car args)]
+              [code `((value ,var (shift r ,a)))])
+         (values (append (reverse code) ir) var))]
+      [zero?
+       (let* ([var (symgen "is-zero")]
+              [a (car args)]
+              [code `((value ,var (cmp = ,a zero)))])
+         (values (append (reverse code) ir) var))]
+      [(< > <= >= = !=)
        (let* ([a (car args)] [b (cadr args)]
               [result (symgen "cmp")]
               [code `((value ,result (cmp ,fn ,a ,b)))])
@@ -484,13 +549,12 @@
          (let* ([b (cadr args)]
                 [code `((store ,a ,b))])
            (values (append code ir) a)))]
-      [return
-       (let* ([x (car args)]
-              [code `((return ,x))])
-         (values (append code ir) x))]
-      [print
-       (let* ([x (car args)] [code `((print ,x))])
-         (values (append code ir) x))]
+      [return (let* ([x (car args)]
+                     [code `((return ,x))])
+                (values (append code ir) x))]
+      [print (let* ([x (car args)] [code `((print ,x))])
+               (values (append code ir) x))]
+      [halt (values (append `((halt)) ir) '(const-ref 0))]
       [else (error "builtin-ir" (format "unknown builtin ~s" fn))]))
 
   (define (macro-ir env ir name args)
@@ -499,6 +563,11 @@
        (let* ([fn (car args)]
               [val (symgen (format "f-~s" fn))])
          (values (append `((value ,val (fn-addr ,fn))) ir)
+                 val))]
+      [:register
+       (let* ([register (car args)]
+              [val (symgen (format "r-~s" register))])
+         (values (append `((value ,val (register ,register))) ir)
                  val))]
       [else (error "macro-ir" (format "unknown macro ~s" name))]))
 
@@ -553,12 +622,12 @@
                  [ir (cons `(function-body ,arg-values) ir)])
             (descend env ir body))]
 
-         [(eq? form 'prog)
-          (let prog ([statements (cdr expr)]
-                     [ir ir] [ret (void)])
+         [(eq? form 'begin)
+          (let begin ([statements (cdr expr)]
+                      [ir ir] [ret (void)])
             (if (null? statements) (values ir ret)
                 (let-values ([(ir ret) (descend env ir (car statements))])
-                  (prog (cdr statements) ir ret))))]
+                  (begin (cdr statements) ir ret))))]
 
          [(eq? form 'while)
           (let* ([condition (cadr expr)]
@@ -572,7 +641,7 @@
                  [(ir) (cons `(branch ,test ,loop-body) ir)]
                  [(ir) (cons `(jump ,end) ir)]
                  [(ir) (cons `(label ,loop-body) ir)]
-                 [(ir ret) (descend env ir (cons 'prog body))]
+                 [(ir ret) (descend env ir (cons 'begin body))]
                  [(ir) (cons `(jump ,repeat) ir)]
                  [(ir) (cons `(label ,end) ir)])
               (values ir ret)))]
@@ -590,11 +659,11 @@
                      [(ir test) (descend env ir condition)]
                      [(ir) (cons `(branch ,test ,if-true) ir)]
                      [(ir false-ret) (descend env ir false-expr)]
-                     [(ir _) (builtin-ir env ir '= (list if-val false-ret))]
+                     [(ir _) (builtin-ir env ir 'set! (list if-val false-ret))]
                      [(ir) (cons `(jump ,if-end) ir)]
                      [(ir) (cons `(label ,if-true) ir)]
                      [(ir true-ret) (descend env ir true-expr)]
-                     [(ir _) (builtin-ir env ir '= (list if-val true-ret))]
+                     [(ir _) (builtin-ir env ir 'set! (list if-val true-ret))]
                      [(ir) (cons `(label ,if-end) ir)])
                   (values ir if-val))))]
 
@@ -626,6 +695,15 @@
                 (let ([ir (append arg-ir ir)])
                   (builtin-ir env ir form (reverse arg-values)))))]
 
+         [(eq? form 'io)
+          (let* ([var (symgen "io")]
+                 [args (cdr expr)]
+                 [mode (car args)]
+                 [a (cadr args)])
+            (let-values ([(ir a) (descend env ir a)])
+              (let* ([code `((value ,var (io (immediate ,mode) ,a)))])
+                (values (append code ir) var))))]
+
          [(macro? form) (macro-ir env ir form (cdr expr))]
 
          [else (error "ir generation" (format "unrecognized form\n    ~s" expr))])
@@ -640,11 +718,13 @@
   (define (extract-uses instr)
     (record-case
      instr
-     [load (a) (list a)]
+     [(load bit-not zero?) (a) (list a)]
      [cmp (_ a b) (list a b)]
-     [(+ -) (a b) (list a b)]
-     [(const fn-addr) _ '()]
+     [io (_ a) (list a)]
+     [(+ - bit-xor bit-or bit-and) (a b) (list a b)]
+     [(const fn-addr register) _ '()]
      [call (_ _ . args) args]
+     [shift (_ a) (list a)]
      [addr-call (_ f . args) (cons f args)]
      [else (error "lifetime"
                   (format "unknown builtin:\n   ~s" instr))]))
@@ -701,6 +781,7 @@
        [(label jump) (id) (void)]
        [(branch) (cmp _) (use cmp)]
        [print (x) (use x)]
+       [halt () (void)]
        [else (error "lifetimes"
                     (format "unknown ir form:\n    ~s" instr))])
 
@@ -795,6 +876,7 @@
   (define (reference! fn ir-line var)
     (cond
      [(and (pair? var) (eq? (car var) 'const-ref)) var]
+     [(and (pair? var) (eq? (car var) 'immediate)) var]
      [else
       (symbol-hashtable-update! local-vars-referenced fn
                                 (λ (vars) (cons var vars)) '())
@@ -899,15 +981,9 @@
             [call-save-registers
              (let* ([fn (cadr line)] [ir-line (caddr line)]
                     [live-variables (live-registers fn ir-line)]
-                    [save
-                     `((comment ,(format
-                                  "call-save ~s ~s"
-                                  live-variables
-                                  (map (λ (r) (hashtable-ref registers r #f))
-                                       live-variables)))
-                       (call-save-registers . ,live-variables))])
+                    [save `(call-save-registers . ,live-variables)])
                (set! call-saved live-variables)
-               (append save (scan (cdr asm))))]
+               (cons save (scan (cdr asm))))]
             [call-restore-registers
              (cons `(call-restore-registers . ,call-saved)
                    (scan (cdr asm)))]
@@ -1103,9 +1179,14 @@
   (if (null? asm) '()
       (let* ([instruction (car asm)]
              [const-ref
-              (find
-               (λ (x) (and (pair? x) (eq? 'const-ref (car x))))
-               instruction)])
+              (find (λ (x) (and (pair? x) (eq? 'const-ref (car x))))
+                    instruction)]
+             [immediate
+              (find (λ (x) (and (pair? x) (eq? 'immediate (car x))))
+                    instruction)]
+             [instruction
+              (if (not immediate) instruction
+                  (subst (cadr immediate) immediate instruction))])
         (append
          (if (not const-ref) (list instruction)
              (let ([val (cadr const-ref)])
@@ -1265,11 +1346,16 @@
   (define inline-tail-call #t)
   (define inline-stack '())
   (define label-prefix "")
-  (define inline-fail)
+  (define inline-check)
+  (define inline-check-cycle 0)
   (define function-references '())
 
   (define asm '())
   (define (emit! code)
+    (when inline-context
+      (set! inline-check-cycle (mod (+ 1 inline-check-cycle) 10))
+      (when (zero? inline-check-cycle)
+        (inline-check asm)))
     (set! asm (append (reverse code) asm)))
 
   (define (ref! fn ir-line var)
@@ -1278,22 +1364,22 @@
     `(def ,var ,fn ,ir-line))
 
   (define (approx-code-length code)
-    (length
-     (filter (λ (i) (not (memq (car i) '(comment label))))
-             (asm-pattern-optimizations
-              (asm-remove-unreachable-code
-               (asm-load-consts
-                (asm-register-assignment
-                 (asm-register-allocation
-                  lifetimes (reverse code)))))))))
+    (length (filter (λ (i) (not (memq (car i) '(comment label))))
+                    (asm-pattern-optimizations
+                     (asm-load-consts
+                      (asm-register-assignment
+                       (asm-register-allocation
+                        lifetimes (reverse code))))))))
 
   (define (builtin fn instr line out-var)
     (record-case
      instr
      [cmp (op a b)
-          (let* ([op (case op [== 'eq] [!= 'neq]
+          (let* ([op (case op [= 'eq] [!= 'neq]
                            [< 'less] [<= 'less-or-eq]
-                           [(> >= zero) (void)])]
+                           [(> >= zero)
+                            (error "compare"
+                                   (format "~s is unimplemented" op))])]
                  [a (ref! fn line a)]
                  [b (ref! fn line b)]
                  [out (def! fn line out-var)])
@@ -1304,11 +1390,6 @@
      [load (addr) (let* ([addr (ref! fn line addr)]
                          [out (def! fn (+ 1 line) out-var)])
                     (emit! `((load ,out ,addr))))]
-
-     [fn-addr (function)
-              (set! function-references (cons function function-references))
-              (emit! `((const ,(function-label function))
-                       (mov y ,(def! fn line out-var) const)))]
 
      [(call addr-call)
       (tail-call function . args)
@@ -1325,8 +1406,8 @@
       (define fn-addr
         (if address-call?
             'cond `(const-ref ,(function-label function))))
-      (define-values (restore-asm restore-refs)
-        (values asm function-references))
+      (define-values (restore-asm restore-refs base-asm-cost)
+        (values asm function-references (approx-code-length asm)))
       (define (restore)
         (set! asm restore-asm)
         (set! function-references restore-refs))
@@ -1336,26 +1417,30 @@
         (cond
          [(and (enable-inlining)
                (number? call-cost)
-               (< (length inline-stack) 3)
+               (< (length inline-stack) (enable-inlining))
                inline-retry
                (not address-call?)
                (not (find (λ (frame) (eq? frame fn)) inline-stack)))
           (let ([return-var (def! fn line out-var)]
-                [args (map (λ (val) (ref! fn line val)) args)])
+                [args (map (λ (val) (ref! fn line val)) args)]
+                [inline-fail (λ () (restore) (inline-retry #f))])
             (fluid-let
                 ([inline-context (cons* return-var ret-addr args)]
                  [label-prefix (symbol->string (symgen function))]
                  [inline-stack (cons (cons* fn line) inline-stack)]
                  [inline-tail-call (and inline-tail-call tail-call)]
-                 [inline-fail (λ () (restore) (inline-retry #f))])
+                 [inline-check
+                  (λ (asm) (when (< (+ call-cost 32) (- (approx-code-length asm)
+                                                        base-asm-cost))
+                             (inline-fail)))])
               (emit! `((comment ,(format "inline ~s" function))
                        (inline ,fn ,line)))
+              (if (not (symbol-hashtable-contains? ir function))
+                  (error "inline" (format "unknown function ~s" function)))
               (next function (symbol-hashtable-ref ir function #f) 0)
               (emit! `((label ,ret-addr)
                        (inline-end ,fn ,function)))
-              (when (< call-cost
-                       (- (approx-code-length asm)
-                          (approx-code-length restore-asm)))
+              (when (< call-cost (- (approx-code-length asm) base-asm-cost))
                 (inline-fail))))]
 
          [(and tail-call inline-tail-call (enable-tail-calls))
@@ -1413,8 +1498,7 @@
 
             (when (and (enable-inlining)
                        (not (number? call-cost)))
-              (call-cost (- (approx-code-length asm)
-                            (approx-code-length restore-asm))))
+              (call-cost (- (approx-code-length asm) base-asm-cost)))
             (when (not address-call?)
               (set! function-references (cons function function-references))))]
 
@@ -1467,8 +1551,7 @@
 
           (when (and (enable-inlining)
                      (not (number? call-cost)))
-            (call-cost (- (approx-code-length asm)
-                          (approx-code-length restore-asm))))
+            (call-cost (- (approx-code-length asm) base-asm-cost)))
 
           (when (not address-call?)
             (set! function-references (cons function function-references)))
@@ -1477,6 +1560,7 @@
 
      [const (value) (let* ([out (def! fn line out-var)])
                       (emit! `((mov y ,out (const-ref ,value)))))]
+
      [+ (a b)
         (let* ([a (ref! fn line a)]
                [b (ref! fn line b)]
@@ -1493,12 +1577,43 @@
                    (write ,out)
                    (alu sub ,out ,b))))]
 
+     [(bit-xor bit-or bit-and) (a b)
+      (let* ([a (ref! fn line a)]
+             [b (ref! fn line b)]
+             [out (def! fn line out-var)]
+             [op (case (car instr)
+                   [bit-xor 'xor] [bit-or 'or] [bit-and 'and])])
+        (emit! `((mov y ,out ,a)
+                 (write ,out)
+                 (alu ,op ,out ,b))))]
+
+     [bit-not (a) (let* ([a (ref! fn line a)]
+                         [out (def! fn (+ 1 line) out-var)])
+                    (emit! `((alu not ,out ,a))))]
+
+     [shift (dir a) (let* ([a (ref! fn line a)]
+                           [out (def! fn (+ 1 line) out-var)])
+                      (emit! `((shift ,dir ,out ,a))))]
+
+     [io (mode a)
+         (let* ([val (ref! fn line a)]
+                [out (def! fn (+ 1 line) out-var)])
+           (emit! `((io ,mode ,out ,val))))]
+
+     [fn-addr (function)
+              (set! function-references (cons function function-references))
+              (emit! `((const ,(function-label function))
+                       (mov y ,(def! fn line out-var) const)))]
+
+     [register (r) (let* ([out (def! fn (+ 1 line) out-var)])
+                     (emit! `((mov y ,out ,r))))]
+
      [else (error "asm" (format "unknown builtin ~s" instr))]))
 
   (define (next fn ir line)
     (when (not (null? ir))
       (let ([instr (car ir)])
-        (emit! `((comment ,(format "~s ~s: ~s" fn line instr))))
+        ;; (emit! `((comment ,(format "~s ~s: ~s" fn line instr))))
 
         (record-case
          instr
@@ -1547,6 +1662,9 @@
                              (load ,val stack)
                              (write ,val)))))
               (let* ([inline-args (cddr inline-context)]
+                     [_ (if (not (< position (length inline-args)))
+                            (error "inline"
+                                   (format "missing arguments to ~s" fn)))]
                      [val (list-ref inline-args position)]
                      [var (def! fn line var)])
                 (emit! `((mov y ,var ,val)
@@ -1571,6 +1689,7 @@
                                 (mov y ip const)))))]
 
          [print (x) (emit! `((print ,(ref! fn line x))))]
+         [halt () (emit! `((halt)))]
 
          [else (error "asm" (format "unknown ir form ~s" instr))]))
 
@@ -1620,7 +1739,8 @@
                  (const ,(function-label 'main))
                  (mov y ip const))
                asm
-               '((label ".halt")))]
+               '((label ".halt")
+                 (halt)))]
          [asm (try-optimize asm)])
     asm))
 
@@ -1650,9 +1770,8 @@
   (pretty-initial-indent 0)
   (printf "\n"))
 
-;; low level lisp-like language
 (printf "program          size    cycles    memory  check\n")
-(define (run-l5 name code data checks)
+(define (run-l5 name code inputs checks)
   (let* ([asm (compile code)]
          [bin (assemble asm)]
          [result (format "~16a ~8s" name (length bin))])
@@ -1670,20 +1789,23 @@
     ;; (for-each (λ (i) (printf "~6s\n" (fxsrl i 8)))
     ;;           (binary bin))
 
-    (let-values ([(registers ram cycles) (vm bin data)])
+    (let-values ([(output registers ram cycles) (vm bin inputs)])
       (set! result
             (string-append
              (format "~25a" "")
              (format "~8s" cycles)
              (format "~8o  " (format "~3,1f%" (* 100. (memory-usage ram))))))
-      (if (checks asm registers ram)
+      (if (checks asm output registers ram)
           (set! result (string-append result "ok"))
           (begin
             (set! result (string-append result "failed"))
             (print-asm asm)
+            (print-memory ram)
             (print-registers registers)
-            (print-memory ram)))
-      (printf "~o\n" result))))
+            (pretty-print output)))
+      (printf "~o\n" result))
+
+    ))
 
 (define (memory-usage ram)
   (let ([longest-run 0]
@@ -1697,34 +1819,34 @@
 
 (run-l5 "expr"
         '((fn (main)
-              (= a 13)
-              (= b 5)
-              (= c 12)
+              (set! a 13)
+              (set! b 5)
+              (set! c 12)
               (- (+ (+ a c) (- b b)) b)))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 20 (read-register registers 'v0))))
 
 (run-l5 "reuse"
         '((fn (main)
-              (= a 9)
+              (set! a 9)
               (+ a (+ 9 9))))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 27 (read-register registers 'v0))))
 
 (run-l5 "spill"
         '((fn (main)
               (+ 1 (+ 2 (+ 3 (+ 4 (+ 5 (+ 6 (+ 7 (+ 8 9))))))))))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 45 (read-register registers 'v0))))
 
 (run-l5 "control"
-        '((fn (main) (if (== 0 1) (prog 1 2)
-                         (prog (if (!= 0 1) 4 3)))))
+        '((fn (main) (if (= 0 1) (begin 1 2)
+                         (begin (if (!= 0 1) 4 3)))))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 4 (read-register registers 'v0))))
 
 (run-l5 "fncall"
@@ -1732,45 +1854,45 @@
           (fn (foo a b) (bar a b 7 11))
           (fn (bar q w e r) (+ q (+ w (+ e (- r 10))))))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 13 (read-register registers 'v0))))
 
 (run-l5 "inline"
-        '((fn (main) (= a (foo 1)) a)
-          (fn (foo a) (= b (bar (+ a 2))) b)
-          (fn (bar b) (= c (+ b 3)) c))
+        '((fn (main) (set! a (foo 1)) a)
+          (fn (foo a) (set! b (bar (+ a 2))) b)
+          (fn (bar b) (set! c (+ b 3)) c))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 6 (read-register registers 'v0))))
 
 (run-l5 "fib"
         '((fn (main) (fib 21))
           (fn (fib x)
-              (= a 1) (= b 1)
+              (set! a 1) (set! b 1)
               (while (< 0 x)
-                     (= c a) (= a b)
-                     (+= b c)
-                     (-= x 1))
+                     (set! c a) (set! a b)
+                     (add! b c)
+                     (sub! x 1))
               b))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 28657 (read-register registers 'v0))))
 
 (run-l5 "recursion"
-        '((fn (main) (fib (load 0)))
+        '((fn (main) (fib 20))
           (fn (fib n)
               (if (< n 2) 1
                   (+ (fib (- n 1))
                      (fib (- n 2))))))
-        '(20)
-        (λ (asm registers ram)
+        '()
+        (λ (asm output registers ram)
           (= 10946 (read-register registers 'v0))))
 
 (when (enable-tail-calls)
   (run-l5 "tail-call"
-          '((fn (main) (spin 0 4095))
+          '((fn (main) (spin 0 40))
             (fn (spin n x) (if (< n x) (spin (+ n 1) x) n)))
-          '() (λ (asm registers ram) (> .01 (memory-usage ram)))))
+          '() (λ (asm output registers ram) (> .01 (memory-usage ram)))))
 
 (run-l5 "arg-spill"
         '((fn (a a0 a1 a2 a3 a4 a5 a6 a7 a8 a9)
@@ -1789,61 +1911,61 @@
           (fn (main)
               (a 0 1 2 3 4 5 6 7 8 9)))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 7 (read-register registers 'v0))))
 
 (run-l5 "partial-sums"
         '((fn (main)
-              (= to 16)
-              (= from 0)
-              (= sum 0)
-              (= n 0)
-              (= count 10)
+              (set! to 16)
+              (set! from 0)
+              (set! sum 0)
+              (set! n 0)
+              (set! count 10)
               (while (!= n count)
-                     (+= sum (load from))
+                     (add! sum (io 0 0))
                      (store to sum)
-                     (++ to)
-                     (++ from)
-                     (++ n))
+                     (inc! to)
+                     (inc! from)
+                     (inc! n))
               sum))
         '(1 2 3 4 5 6 7 8 9 65490)
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 65535 (read-register registers 'v0))))
 
 (run-l5 "array"
         '((fn (init) (store 0 1))
           (fn (iota out n)
-              (= i 0)
+              (set! i 0)
               (while (< i n)
                      (store (+ i out) i)
-                     (++ i)))
+                     (inc! i)))
           (fn (range-sum a b)
-              (= sum 0)
+              (set! sum 0)
               (while (< a b)
-                     (+= sum (load a))
-                     (++ a))
+                     (add! sum (load a))
+                     (inc! a))
               sum)
           (fn (main)
               (init)
-              (= size 10)
-              (= arr 16)
-              (iota arr (+ arr size))
+              (set! size 10)
+              (set! arr 16)
+              (iota arr size)
               (range-sum arr (+ arr size))))
         '()
-        (λ (asm registers ram)
+        (λ (asm output registers ram)
           (= 45 (read-register registers 'v0))))
 
 (run-l5
  "cmp"
- '((fn (zero? p) (== p 0))
-   (fn (main) (zero? 0)))
+ '((fn (is-zero p) (zero? p))
+   (fn (main) (is-zero 0)))
  '()
- (λ (asm registers ram) (= 1 (read-register registers 'v0))))
+ (λ (asm output registers ram) (= 1 (read-register registers 'v0))))
 
 
 (run-l5
  "gc"
- `((fn (nil? p) (== 0 p))
+ `((fn (nil? p) (= 0 p))
 
    (fn (mmb-metadata-size) 3)
    (fn (mmb-next p) (load p))
@@ -1864,110 +1986,125 @@
    (fn (mmb-last p) (if (nil? (mmb-next p))
                         p (mmb-last (mmb-next p))))
    (fn (mmb-find-parent from to)
-       (if (== to (mmb-next from))
+       (if (= to (mmb-next from))
            from
-           (prog
-            (= next (mmb-next from))
-            (if (nil? next) 0
-                (mmb-find-parent next to)))))
+           (begin
+             (set! next (mmb-next from))
+             (if (nil? next) 0
+                 (mmb-find-parent next to)))))
 
    (fn (malloc-find-space p size)
-       (= next (mmb-next p))
+       (set! next (mmb-next p))
        (if (nil? next) p
-           (prog (= gap (- next (mmb-past p)))
-                 (if (<= (+ (mmb-metadata-size) size) gap) p
-                     (malloc-find-space next size)))))
+           (begin (set! gap (- next (mmb-past p)))
+                  (if (<= (+ (mmb-metadata-size) size) gap) p
+                      (malloc-find-space next size)))))
+
+   (fn (recently-free) (load 4))
+   (fn (cache-free p) (if (< (recently-free) p) 0 (store 4 p)))
+   (fn (cache-alloc p) (store 4 p))
 
    (fn (malloc size)
-       (= at (malloc-find-space 0 size))
-       (= new (mmb-past at))
-       (mmb-create! new size)
-       (mmb-next-set! new (mmb-next at))
-       (mmb-next-set! at new)
-       (return (+ (mmb-metadata-size) new)))
+       (set! at (malloc-find-space (recently-free) size))
+       (cache-alloc at)
+       (if (< (- (:register stack) 128) at) 0
+           (begin
+             (set! new (mmb-past at))
+             (mmb-create! new size)
+             (mmb-next-set! new (mmb-next at))
+             (mmb-next-set! at new)
+             (return (+ (mmb-metadata-size) new)))))
 
    (fn (free p)
+       (set! p (- p (mmb-metadata-size)))
        (mmb-reachable-set! p 0)
-       (= p (- p (mmb-metadata-size)))
-       (if (nil? p) (return 0) (prog 0))
-       (= prev (mmb-find-parent 0 p))
+       (if (nil? p) (return 0) (begin 0))
+       (set! prev (mmb-find-parent 0 p))
+       (cache-free prev)
        (mmb-next-set! prev (mmb-next p))
        1)
 
    (fn (boehm-reset-reachability root)
-       (= next (mmb-next root))
+       (set! next (mmb-next root))
        (if (nil? next) 0
-           (prog (mmb-reachable-set! next 0)
-                 (boehm-reset-reachability next))))
+           (begin (mmb-reachable-set! next 0)
+                  (boehm-reset-reachability next))))
    (fn (boehm-scan-reachable-region block)
-       (= a (mmb-data block))
-       (= b (mmb-past block))
-       (= found 0)
+       (set! a (mmb-data block))
+       (set! b (mmb-past block))
+       (set! found 0)
        (while (!= a b)
-              (= new (boehm-reachable (load a)))
-              (if (== new 0) 0 (= found 1))
-              (++ a))
+              (set! new (boehm-reachable (load a)))
+              (if (= new 0) 0 (set! found 1))
+              (inc! a))
        found)
    (fn (boehm-valid-block block)
-       (if (< 2 block)
-           (if (< block ,(/ (ram-size) 2)) 1 0) 0))
+       (bit-and (< 2 block) (< block (load 5))))
 
    (fn (marked-reachable? addr)
-       (== (mmb-reachable addr) -1))
+       (= (mmb-reachable addr) -1))
 
    (fn (boehm-reachable-scan root block)
-       (if (== root block)
+       (if (= root block)
            (if (marked-reachable? block) 0
-               (prog
-                (mmb-reachable-set! block -1)
-                ;; scan for further live pointers
-                (boehm-scan-reachable-region block)))
-           (if (nil? (mmb-next root)) 0
+               (begin
+                 (mmb-reachable-set! block -1)
+                 ;; scan for further live pointers
+                 (boehm-scan-reachable-region block)))
+           (if (bit-or (nil? (mmb-next root)) (< block root)) 0
                (boehm-reachable-scan (mmb-next root) block))))
    (fn (boehm-reachable addr)
-       (= block (- addr (mmb-metadata-size)))
+       (set! block (- addr (mmb-metadata-size)))
        (if (boehm-valid-block block)
            (boehm-reachable-scan 0 block)
            0))
-   (fn (munge-stack s k)
-       (if (< s 1131) 1131
-           (+ k (- k (munge-stack (- s k) k)))))
+
+   (fn (boehm-free p)
+       (set! a (mmb-data p))
+       (set! b (mmb-past p))
+       (free a))
    (fn (boehm-free-unreachable p)
-       (= next (mmb-next p))
+       (set! next (mmb-next p))
        (if (nil? next) 0
            (if (marked-reachable? next)
                (boehm-free-unreachable next)
-               (prog (free (+ next (mmb-metadata-size)))
-                     (boehm-free-unreachable p)))))
+               (begin (boehm-free next)
+                      (boehm-free-unreachable p)))))
    (fn (boehm-gc)
-       (munge-stack 2771 113)
-       (= root 0)
+       (set! root 0)
        (boehm-reset-reachability 0)
        (mmb-reachable-set! root -1)
-       (= stack ,(/ (ram-size) 2))
-       (while (< stack ,(ram-size))
-              (boehm-reachable (load stack))
-              (++ stack))
-       (boehm-free-unreachable root))
+       (set! scan-boundary (mmb-past (mmb-last 0)))
+       (store 5 scan-boundary)
+       (set! scan (:register stack))
+       (while (< scan ,(ram-size))
+              (boehm-reachable (load scan))
+              (inc! scan))
+       (boehm-free-unreachable root)
+       )
 
-   (fn (gc-init) (mmb-size-set! 0 2))
+   (fn (gc-init)
+       (set! root 0)
+       (store 4 0)
+       (mmb-size-set! root 3))
+
    (fn (gc-alloc size)
-       (= allocated (+ size (load 4)))
-       (store 4 allocated)
-       (if (< allocated 128) 0
-           (prog (store 4 0)
-                 (boehm-gc)))
-       (malloc size))
+       (set! allocated (+ size (load 3)))
+       (store 3 allocated)
+       (if (< allocated 128) (malloc size)
+           (begin (store 3 0)
+                  (boehm-gc)
+                  (malloc size))))
 
-   (fn (nil) (:fn-addr nil))
+   (fn (nil) -1)
    (fn (cons x l)
-       (= cell (gc-alloc 2))
+       (set! cell (gc-alloc 2))
        (store cell x)
        (store (+ 1 cell) l)
        cell)
    (fn (car l) (load l))
    (fn (cdr l) (load (+ 1 l)))
-   (fn (null? l) (== (:fn-addr nil) l))
+   (fn (null? l) (= -1 l))
 
    (fn (map f l)
        (if (null? l) (nil)
@@ -1989,15 +2126,14 @@
            (+ (car l) (sum (cdr l)))))
 
    (fn (double x) (+ x x))
-   (fn (display x) (print x))
 
-   (fn (mul a b) (= s 0)
-       (while (< 0 a) (-= a 1) (+= s b)))
-   (fn (div a b) (= s 0)
-       (while (<= b a) (-= a b) (+= s 1)))
+   (fn (mul a b) (set! s 0)
+       (while (< 0 a) (sub! a 1) (add! s b)))
+   (fn (div a b) (set! s 0)
+       (while (<= b a) (sub! a b) (add! s 1)))
    (fn (mod a b) (- a (mul b (div a b))))
 
-   (fn (even? x) (== 0 (mod x 2)))
+   (fn (even? x) (= 0 (mod x 2)))
 
    (fn (waste-space)
        (sum (map (:fn-addr double)
@@ -2010,6 +2146,303 @@
        (waste-space)
        (waste-space)))
  '()
- (λ (asm registers ram)
-   (> .8 (memory-usage ram))
-   (= 180 (read-register registers 'v0))))
+ (λ (asm output registers ram)
+   (and (or (not (enable-tail-calls))
+            (> .8 (memory-usage ram)))
+        (= 180 (read-register registers 'v0)))
+   ))
+
+
+;; (run-l5 "shoot"
+;;         '((fn (sees-something)
+;;               (< 0 (io 0 0)))
+;;           (fn (right) (io 1 0))
+;;           (fn (down) (io 1 1))
+;;           (fn (left) (io 1 2))
+;;           (fn (up) (io 1 3))
+;;           (fn (wait) (io 1 5))
+;;           (fn (shoot) (io 1 6))
+;;           (fn (main)
+;;               (right) (right) (right)
+;;               (up) (up) (up) (up)
+;;               (while 1 (if (sees-something)
+;;                            (shoot) (wait)))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+
+;; (run-l5 "maze"
+;;         '((fn (sees-wall)
+;;               (= 1 (io 0 0)))
+;;           (fn (right) (io 1 0))
+;;           (fn (down) (io 1 1))
+;;           (fn (left) (io 1 2))
+;;           (fn (up) (io 1 3))
+;;           (fn (wait) (io 1 4))
+;;           (fn (use) (io 1 5))
+;;           (fn (shoot) (io 1 6))
+;;           (fn (step-forward d)
+;;               (if (= d 0) (up)
+;;                   (if (= d 1) (right)
+;;                       (if (= d 2) (down)
+;;                           (left)))))
+;;           (fn (turn-right d)
+;;               (if (= d 3) 0 (+ 1 d)))
+;;           (fn (turn-left d)
+;;               (if (= d 0) 3 (- d 1)))
+;;           (fn (main)
+;;               (set! facing 0)
+;;               (while 1
+;;                      (step-forward facing)
+;;                      (use)
+;;                      (set! facing (turn-left facing))
+;;                      (step-forward facing)
+;;                      (while (sees-wall)
+;;                             (set! facing (turn-right facing))
+;;                             (step-forward facing)))
+;;               ))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+
+(run-l5 "xor-pairs"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (main)
+              (set! continue 1)
+              (while continue
+                     (set! a (read-io))
+                     (set! b (read-io))
+                     (if (= a 0) (set! continue 0)
+                         (send-io (bit-xor a b))))))
+        '(-1 -1  3 1 0)
+        (λ (asm output registers ram)
+          (equal? output '(0 2))))
+
+
+;; (run-l5 "shifts"
+;;         '((fn (read-io) (io 0 0))
+;;           (fn (send-io a) (io 1 a))
+;;           (fn (main)
+;;               (while 1
+;;                      (send-io (lshift (read-io)))
+;;                      (send-io (rshift (read-io))))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+(run-l5 "send-32"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (main)
+              (set! n 0)
+              (while (< n 32)
+                     (store n (read-io))
+                     (inc! n))
+              (set! n 0)
+              (while (< n 32)
+                     (send-io (load n))
+                     (inc! n))))
+        '(94 29 53 6 51 85 68 88 72 10 49 38 88 37 22 19
+             85 24 78 41 6 91 97 18 68 72 92 69 94 63 7 48)
+        (λ (asm output registers ram)
+          (equal? output '(94 29 53 6 51 85 68 88 72 10 49 38 88 37 22 19
+                              85 24 78 41 6 91 97 18 68 72 92 69 94 63 7 48))))
+
+(run-l5 "div"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (mul a b) (set! s 0)
+              (while (< 0 a) (sub! a 1) (add! s b)))
+          (fn (div a b) (set! s 0)
+              (while (<= b a) (sub! a b) (add! s 1)))
+          (fn (mod a b) (- a (mul b (div a b))))
+          (fn (next a b)
+              (if (= 0 a) 0
+                  (begin
+                    (send-io (div a b))
+                    (send-io (mod a b))
+                    (next (read-io) (read-io)))))
+          (fn (main) (next (read-io) (read-io))))
+        '(8 4  7 3  4 9  12 1 0)
+        (λ (asm output registers ram)
+          (equal? output '(2 0 2 1 0 4 12 0))))
+
+(run-l5 "planets"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (planets capitalize c)
+              (if (= c 0) 0
+                  (begin
+                    (send-io
+                     (if capitalize (- c 32) c))
+                    (planets (= c 32) (read-io)))))
+          (fn (main)
+              (planets 1 (read-io))
+              (set! capitalize 1)))
+        (append!
+         (map char->integer (string->list "abc def"))
+         '(0))
+        (λ (asm output registers ram)
+          (equal? (list->string (map integer->char output)) "Abc Def")))
+
+
+;; (run-l5 "fruit-filter"
+;;         '((fn (look) (io 0 0))
+;;           (fn (right) (io 1 0))
+;;           (fn (down) (io 1 1))
+;;           (fn (left) (io 1 2))
+;;           (fn (up) (io 1 3))
+;;           (fn (wait) (io 1 4))
+;;           (fn (use) (io 1 5))
+;;           (fn (main)
+;;               (right) (right)
+;;               (up) (up) (up) (up) (up)
+;;               (left) (left) (up) (up)
+;;               (while
+;;                1
+;;                (set! sees (look))
+;;                (if (< 12 sees) 0
+;;                    (if sees
+;;                        (begin
+;;                         (set! fruit sees)
+;;                         (if (load fruit)
+;;                             (begin (right) (use) (up))
+;;                             (store fruit 1)))
+;;                        0))
+;;                (wait))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+
+(run-l5 "radix"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (main)
+              (set! n 0)
+              (while (< n 15)
+                     (set! index (read-io))
+                     (store index (+ 1 (load index)))
+                     (inc! n))
+              (set! n 0)
+              (set! count 0)
+              (while (< count 15)
+                     (while (load n)
+                            (send-io n)
+                            (store n (- (load n) 1))
+                            (inc! count))
+                     (inc! n))))
+        '(85 24 78 41 6 91 97 18 68 72 92 69 94 63 7)
+        (λ (asm output registers ram)
+          (equal? output
+                  (sort < '(85 24 78 41 6 91 97
+                               18 68 72 92 69 94 63 7)))))
+
+
+;; (run-l5 "hanoi"
+;;         '((fn (read-io) (io 0 0))
+;;           (fn (send-io a) (io 1 a))
+;;           (fn (magnet) (send-io 5))
+;;           (fn (move-disc a b)
+;;               (send-io a) (magnet)
+;;               (send-io b) (magnet))
+;;           (fn (move disc src dst tmp)
+;;               (if (= disc 0)
+;;                   (move-disc src dst)
+;;                   (begin
+;;                    (move (- disc 1) src tmp dst)
+;;                    (move-disc src dst)
+;;                    (move (- disc 1) tmp dst src))))
+;;           (fn (main)
+;;               (set! discs (read-io))
+;;               (set! src (read-io))
+;;               (set! dst (read-io))
+;;               (set! tmp (read-io))
+;;               (move discs src dst tmp)))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+
+(run-l5 "water"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (find-reservoir pos height best-barrier)
+              (set! next-pos (+ pos 1))
+              (set! next-height (load next-pos))
+              (if (<= (load best-barrier) next-height)
+                  (set! best-barrier next-pos)
+                  0)
+              (if (<= 15 next-pos)
+                  best-barrier
+                  (if (<= height next-height)
+                      next-pos
+                      (find-reservoir next-pos height best-barrier))))
+          (fn (min a b) (if (< a b) a b))
+          (fn (reservoir-volume start end)
+              (set! volume 0)
+              (set! water-level (min (load start) (load end)))
+              (while (< start end)
+                     (set! ground-level (load start))
+                     (add! volume
+                           (if (< ground-level water-level)
+                               (- water-level ground-level) 0))
+                     (inc! start))
+              volume)
+          (fn (main)
+              (set! n 0)
+              (while (< n 16) (store n (read-io)) (inc! n))
+              (set! total-volume 0)
+              (set! n 0)
+              (while (< n 15)
+                     (set! reservoir-end
+                           (find-reservoir n (load n) (+ n 1)))
+                     (set! volume (reservoir-volume n reservoir-end))
+                     (add! total-volume volume)
+                     (set! n reservoir-end))
+              (send-io total-volume)))
+        '(4 6 1 4 6 5 1 4 1 2 6 5 6 1 4 2)
+        (λ (asm output registers ram) (memq 28 output)))
+
+
+(run-l5 "nak"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (mul a b) (set! s 0)
+              (while (< 0 a) (sub! a 1) (add! s b)))
+          (fn (div a b) (set! s 0)
+              (while (<= b a) (sub! a b) (add! s 1)))
+          (fn (mod a b) (- a (mul b (div a b))))
+          (fn (main)
+              (set! cards (read-io))
+              (while (< 0 cards)
+                     (send-io (mod (- cards 1) 4))
+                     (set! cards (read-io)))))
+        '(2 3 4 0)
+        (λ (asm output registers ram) (equal? output '(1 2 3))))
+
+(run-l5 "nakker"
+        '((fn (read-io) (io 0 0))
+          (fn (send-io a) (io 1 a))
+          (fn (mod-4 a) (bit-and 3 a))
+          (fn (main)
+              (set! cards (read-io))
+              (while (< 0 cards)
+                     (send-io (mod-4 (- cards 1)))
+                     (set! cards (read-io)))))
+        '(2 3 4 0)
+        (λ (asm output registers ram) (equal? output '(1 2 3))))
+
+;; (run-l5 "dance"
+;;         '((fn (read-io) (io 0 0))
+;;           (fn (send-io a) (io 1 a))
+;;           (fn (mod-4 a) (bit-and 3 a))
+;;           (fn (xorshift x)
+;;               (set! a (bit-xor x (rshift x)))
+;;               (set! b (bit-and 255 (bit-xor a (lshift a))))
+;;               (bit-xor b (rshift (rshift b))))
+;;           (fn (main)
+;;               (set! seed (read-io))
+;;               (while 1
+;;                      (set! seed (xorshift seed))
+;;                      (send-io (mod-4 seed)))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
