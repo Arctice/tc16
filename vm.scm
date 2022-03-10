@@ -2300,58 +2300,6 @@
    ))
 
 
-;; (run-l5 "shoot"
-;;         '((fn (sees-something)
-;;               (< 0 (io 0 0)))
-;;           (fn (right) (io 1 0))
-;;           (fn (down) (io 1 1))
-;;           (fn (left) (io 1 2))
-;;           (fn (up) (io 1 3))
-;;           (fn (wait) (io 1 5))
-;;           (fn (shoot) (io 1 6))
-;;           (fn (main)
-;;               (right) (right) (right)
-;;               (up) (up) (up) (up)
-;;               (while 1 (if (sees-something)
-;;                            (shoot) (wait)))))
-;;         '()
-;;         (λ (asm output registers ram) #t))
-
-
-;; (run-l5 "maze"
-;;         '((fn (sees-wall)
-;;               (= 1 (io 0 0)))
-;;           (fn (right) (io 1 0))
-;;           (fn (down) (io 1 1))
-;;           (fn (left) (io 1 2))
-;;           (fn (up) (io 1 3))
-;;           (fn (wait) (io 1 4))
-;;           (fn (use) (io 1 5))
-;;           (fn (shoot) (io 1 6))
-;;           (fn (step-forward d)
-;;               (if (= d 0) (up)
-;;                   (if (= d 1) (right)
-;;                       (if (= d 2) (down)
-;;                           (left)))))
-;;           (fn (turn-right d)
-;;               (if (= d 3) 0 (+ 1 d)))
-;;           (fn (turn-left d)
-;;               (if (= d 0) 3 (- d 1)))
-;;           (fn (main)
-;;               (set! facing 0)
-;;               (while 1
-;;                      (step-forward facing)
-;;                      (use)
-;;                      (set! facing (turn-left facing))
-;;                      (step-forward facing)
-;;                      (while (sees-wall)
-;;                             (set! facing (turn-right facing))
-;;                             (step-forward facing)))
-;;               ))
-;;         '()
-;;         (λ (asm output registers ram) #t))
-
-
 (run-l5 "xor-pairs"
         '((fn (read-io) (io 0 0))
           (fn (send-io a) (io 1 a))
@@ -2366,16 +2314,6 @@
         (λ (asm output registers ram)
           (equal? output '(0 2))))
 
-
-;; (run-l5 "shifts"
-;;         '((fn (read-io) (io 0 0))
-;;           (fn (send-io a) (io 1 a))
-;;           (fn (main)
-;;               (while 1
-;;                      (send-io (lshift (read-io)))
-;;                      (send-io (rshift (read-io))))))
-;;         '()
-;;         (λ (asm output registers ram) #t))
 
 (run-l5 "send-32"
         '((fn (read-io) (io 0 0))
@@ -2433,33 +2371,6 @@
           (equal? (list->string (map integer->char output)) "Abc Def")))
 
 
-;; (run-l5 "fruit-filter"
-;;         '((fn (look) (io 0 0))
-;;           (fn (right) (io 1 0))
-;;           (fn (down) (io 1 1))
-;;           (fn (left) (io 1 2))
-;;           (fn (up) (io 1 3))
-;;           (fn (wait) (io 1 4))
-;;           (fn (use) (io 1 5))
-;;           (fn (main)
-;;               (right) (right)
-;;               (up) (up) (up) (up) (up)
-;;               (left) (left) (up) (up)
-;;               (while
-;;                1
-;;                (set! sees (look))
-;;                (if (< 12 sees) 0
-;;                    (if sees
-;;                        (begin
-;;                         (set! fruit sees)
-;;                         (if (load fruit)
-;;                             (begin (right) (use) (up))
-;;                             (store fruit 1)))
-;;                        0))
-;;                (wait))))
-;;         '()
-;;         (λ (asm output registers ram) #t))
-
 
 (run-l5 "radix"
         '((fn (read-io) (io 0 0))
@@ -2483,30 +2394,6 @@
           (equal? output
                   (sort < '(85 24 78 41 6 91 97
                                18 68 72 92 69 94 63 7)))))
-
-
-;; (run-l5 "hanoi"
-;;         '((fn (read-io) (io 0 0))
-;;           (fn (send-io a) (io 1 a))
-;;           (fn (magnet) (send-io 5))
-;;           (fn (move-disc a b)
-;;               (send-io a) (magnet)
-;;               (send-io b) (magnet))
-;;           (fn (move disc src dst tmp)
-;;               (if (= disc 0)
-;;                   (move-disc src dst)
-;;                   (begin
-;;                    (move (- disc 1) src tmp dst)
-;;                    (move-disc src dst)
-;;                    (move (- disc 1) tmp dst src))))
-;;           (fn (main)
-;;               (set! discs (read-io))
-;;               (set! src (read-io))
-;;               (set! dst (read-io))
-;;               (set! tmp (read-io))
-;;               (move discs src dst tmp)))
-;;         '()
-;;         (λ (asm output registers ram) #t))
 
 
 (run-l5 "water"
@@ -2577,6 +2464,120 @@
                      (set! cards (read-io)))))
         '(2 3 4 0)
         (λ (asm output registers ram) (equal? output '(1 2 3))))
+
+;; these are solutions to in-game puzzles
+
+;; (run-l5 "shoot"
+;;         '((fn (sees-something)
+;;               (< 0 (io 0 0)))
+;;           (fn (right) (io 1 0))
+;;           (fn (down) (io 1 1))
+;;           (fn (left) (io 1 2))
+;;           (fn (up) (io 1 3))
+;;           (fn (wait) (io 1 5))
+;;           (fn (shoot) (io 1 6))
+;;           (fn (main)
+;;               (right) (right) (right)
+;;               (up) (up) (up) (up)
+;;               (while 1 (if (sees-something)
+;;                            (shoot) (wait)))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+
+;; (run-l5 "maze"
+;;         '((fn (sees-wall)
+;;               (= 1 (io 0 0)))
+;;           (fn (right) (io 1 0))
+;;           (fn (down) (io 1 1))
+;;           (fn (left) (io 1 2))
+;;           (fn (up) (io 1 3))
+;;           (fn (wait) (io 1 4))
+;;           (fn (use) (io 1 5))
+;;           (fn (shoot) (io 1 6))
+;;           (fn (step-forward d)
+;;               (if (= d 0) (up)
+;;                   (if (= d 1) (right)
+;;                       (if (= d 2) (down)
+;;                           (left)))))
+;;           (fn (turn-right d)
+;;               (if (= d 3) 0 (+ 1 d)))
+;;           (fn (turn-left d)
+;;               (if (= d 0) 3 (- d 1)))
+;;           (fn (main)
+;;               (set! facing 0)
+;;               (while 1
+;;                      (step-forward facing)
+;;                      (use)
+;;                      (set! facing (turn-left facing))
+;;                      (step-forward facing)
+;;                      (while (sees-wall)
+;;                             (set! facing (turn-right facing))
+;;                             (step-forward facing)))
+;;               ))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+
+;; (run-l5 "shifts"
+;;         '((fn (read-io) (io 0 0))
+;;           (fn (send-io a) (io 1 a))
+;;           (fn (main)
+;;               (while 1
+;;                      (send-io (lshift (read-io)))
+;;                      (send-io (rshift (read-io))))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+;; (run-l5 "fruit-filter"
+;;         '((fn (look) (io 0 0))
+;;           (fn (right) (io 1 0))
+;;           (fn (down) (io 1 1))
+;;           (fn (left) (io 1 2))
+;;           (fn (up) (io 1 3))
+;;           (fn (wait) (io 1 4))
+;;           (fn (use) (io 1 5))
+;;           (fn (main)
+;;               (right) (right)
+;;               (up) (up) (up) (up) (up)
+;;               (left) (left) (up) (up)
+;;               (while
+;;                1
+;;                (set! sees (look))
+;;                (if (< 12 sees) 0
+;;                    (if sees
+;;                        (begin
+;;                         (set! fruit sees)
+;;                         (if (load fruit)
+;;                             (begin (right) (use) (up))
+;;                             (store fruit 1)))
+;;                        0))
+;;                (wait))))
+;;         '()
+;;         (λ (asm output registers ram) #t))
+
+;; (run-l5 "hanoi"
+;;         '((fn (read-io) (io 0 0))
+;;           (fn (send-io a) (io 1 a))
+;;           (fn (magnet) (send-io 5))
+;;           (fn (move-disc a b)
+;;               (send-io a) (magnet)
+;;               (send-io b) (magnet))
+;;           (fn (move disc src dst tmp)
+;;               (if (= disc 0)
+;;                   (move-disc src dst)
+;;                   (begin
+;;                    (move (- disc 1) src tmp dst)
+;;                    (move-disc src dst)
+;;                    (move (- disc 1) tmp dst src))))
+;;           (fn (main)
+;;               (set! discs (read-io))
+;;               (set! src (read-io))
+;;               (set! dst (read-io))
+;;               (set! tmp (read-io))
+;;               (move discs src dst tmp)))
+;;         '()
+;;         (λ (asm output registers ram) #t))
 
 ;; (run-l5 "dance"
 ;;         '((fn (read-io) (io 0 0))
